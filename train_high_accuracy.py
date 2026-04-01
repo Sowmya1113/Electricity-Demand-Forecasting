@@ -28,7 +28,7 @@ def train_for_accuracy():
     # 1. Load data
     # 1. Load data
     if not os.path.exists('actual_demand.csv'):
-        from Weather import fetch_actual_data
+        from actual import fetch_actual_data
         logger.info("Fetching real historical demand data...")
         df = fetch_actual_data()
         if not df.empty:
