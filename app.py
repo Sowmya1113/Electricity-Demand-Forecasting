@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ElectricityApp")
 
 import streamlit as st
-from streamlit-option-menu import option-menu
+from streamlit_option_menu import option_menu
 from data_pipeline import EmberEnergyClient
 
 st.set_page_config(
