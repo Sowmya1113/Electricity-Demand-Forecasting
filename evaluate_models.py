@@ -20,12 +20,12 @@ logger = logging.getLogger("Evaluator")
 
 def evaluate():
     # 1. Load data
-    if not os.path.exists('synthetic_demand.csv'):
-        from generate_data import generate_synthetic_data
-        df = generate_synthetic_data(days=365)
-        df.to_csv('synthetic_demand.csv', index=False)
+    if not os.path.exists('actual_demand.csv'):
+        from Weather import fetch_actual_data
+        df = fetch_actual_data()
+        df.to_csv('actual_demand.csv', index=False)
     else:
-        df = pd.read_csv('synthetic_demand.csv')
+        df = pd.read_csv('actual_demand.csv')
     
     logger.info(f"Loaded {len(df)} rows of data")
     
