@@ -1,744 +1,934 @@
-# ============================================
-# data_pipeline.py
-# PURPOSE: Fully Automated Electricity Demand Forecasting
-# VERSION: 3.0 - Zero Hardcoded Values - Everything Learned from Data
-# ============================================
-
 import os
 import json
 import logging
 import warnings
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple, Union
-from dataclasses import dataclass, field
-from functools import lru_cache, wraps
-from concurrent.futures import ThreadPoolExecutor
-import pickle
-
 import requests
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-
 warnings.filterwarnings("ignore")
+NASA_POWER_BASE_URL  = "https://power.larc.nasa.gov/api/temporal/daily/point"
+NASA_POWER_COMMUNITY = "RE"
+NASA_POWER_FORMAT    = "JSON"
+INDIA_LAT, INDIA_LON = 20.5937, 78.9629
+
+DEFAULT_LAG_HOURS       = [1, 2, 3, 24, 48, 168]
+DEFAULT_ROLLING_WINDOWS = [3, 7, 14, 30]
+CYCLICAL_FEATURES       = ["hour", "day_of_week", "month"]
+
+# IEC 61400-1 wind turbine engineering standards
+WIND_CUT_IN_SPEED  = 3    # m/s
+WIND_CUT_OUT_SPEED = 25   # m/s
+
+# ASHRAE 55 standard base temperatures for degree-day calculation
+HEATING_BASE_TEMP = 18   # °C
+COOLING_BASE_TEMP = 21   # °C
+
+# Data quality control rules
+MIN_COMPLETENESS_RATIO   = 0.95
+MAX_ALLOWED_OUTLIERS     = 0.05
+MAX_TEMP_CHANGE_PER_HOUR = 10
+
+# Physical measurement bounds (India recorded extremes + instrument limits)
+TEMP_MIN,       TEMP_MAX       = -30, 55
+HUMIDITY_MIN,   HUMIDITY_MAX   = 0,   100
+WIND_SPEED_MIN, WIND_SPEED_MAX = 0,   50
+SOLAR_MIN,      SOLAR_MAX      = 0,   12   # GHI physical ceiling kWh/m²/day
+
+# Cache path for computed defaults (populated on first successful API call)
+_DEFAULTS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "cache", "india_defaults.json")
+
 
 # ============================================
-# SECTION 1: CONFIGURATION (Only API endpoints - NO manual numbers)
+# SECTION 2: EXCEPTION HANDLING & LOGGING
 # ============================================
+class DataPipelineError(Exception):     pass
+class APIFetchError(DataPipelineError): pass
+class DataValidationError(DataPipelineError): pass
+class MissingDataError(DataPipelineError):    pass
 
-@dataclass(frozen=True)
-class Config:
-    """Configuration - Only API endpoints and physical constants. NO manual multipliers."""
-    # API Settings (cannot be learned - must be provided)
-    NASA_POWER_URL: str = "https://power.larc.nasa.gov/api/temporal/daily/point"
-    NASA_COMMUNITY: str = "RE"
-    NASA_FORMAT: str = "JSON"
-    EMBER_API_KEY: str = "22a3271e-b37d-3f53-f084-1c5ffab5b64d"
-    EMBER_BASE_URL: str = "https://api.ember-energy.org/v1/electricity-generation/monthly"
-    
-    # India Location (geographic fact - cannot be learned)
-    INDIA_LAT: float = 20.5937
-    INDIA_LON: float = 78.9629
-    
-    # Physical constants (universal - cannot be learned)
-    WIND_CUT_IN: float = 3.0      # IEC standard
-    WIND_CUT_OUT: float = 25.0    # IEC standard
-    WIND_OPTIMAL: float = 12.0    # Turbine design standard
-    SOLAR_MAX: float = 12.0       # Physical limit (kWh/m²/day)
-    HEATING_BASE: float = 18.0    # ASHRAE standard
-    COOLING_BASE: float = 21.0    # ASHRAE standard
-    
-    # Physical limits (universal - cannot be learned)
-    TEMP_RANGE: Tuple[float, float] = (-30.0, 55.0)
-    HUMIDITY_RANGE: Tuple[float, float] = (0.0, 100.0)
-    WIND_RANGE: Tuple[float, float] = (0.0, 50.0)
-    
-    # Quality rules (engineering decisions - configurable)
-    MIN_COMPLETENESS: float = 0.95
-    MAX_OUTLIERS: float = 0.05
-    
-    # Feature settings (model architecture - configurable)
-    LAG_HOURS: Tuple = (1, 2, 3, 24, 48, 168)
-    ROLLING_WINDOWS: Tuple = (3, 7, 14, 30)
-    
-    # Learning settings
-    HISTORICAL_YEARS: int = 5
-    CACHE_DIR: str = field(default=os.path.join(os.path.dirname(__file__), "cache"))
-
-CONFIG = Config()
-
-# ============================================
-# SECTION 2: LOGGING & UTILITIES
-# ============================================
 
 def setup_logger(name: str = "DataPipeline") -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        ))
-        logger.addHandler(handler)
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logger.addHandler(h)
         logger.setLevel(logging.INFO)
     return logger
 
+
 logger = setup_logger()
 
-def ensure_cache_dir():
-    """Ensure cache directory exists"""
-    os.makedirs(CONFIG.CACHE_DIR, exist_ok=True)
+def _fetch_nasa_climatology_stats() -> Dict:
 
-# ============================================
-# SECTION 3: DATA LEARNER - Learns ALL patterns from historical data
-# ============================================
-
-class DataLearner:
-    """
-    Learns ALL seasonal patterns, location factors, and relationships
-    directly from historical NASA data. NO manual numbers.
-    """
-    
-    _instance = None
-    _learned_factors = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialize()
-        return cls._instance
-    
-    def _initialize(self):
-        ensure_cache_dir()
-        self.cache_path = os.path.join(CONFIG.CACHE_DIR, "learned_factors.pkl")
-        self._load_or_learn()
-    
-    def _load_or_learn(self):
-        """Load cached learned factors or learn from historical data"""
-        if os.path.exists(self.cache_path):
-            try:
-                with open(self.cache_path, 'rb') as f:
-                    self._learned_factors = pickle.load(f)
-                logger.info(f"Loaded learned factors from cache (built: {self._learned_factors.get('built_at', 'unknown')})")
-                return
-            except Exception as e:
-                logger.warning(f"Could not load cached factors: {e}")
-        
-        logger.info("Learning factors from historical NASA data...")
-        self._learn_factors_from_historical_data()
-        
-        # Save to cache
-        try:
-            with open(self.cache_path, 'wb') as f:
-                pickle.dump(self._learned_factors, f)
-            logger.info(f"Saved learned factors to cache: {self.cache_path}")
-        except Exception as e:
-            logger.warning(f"Could not save learned factors: {e}")
-    
-    def _learn_factors_from_historical_data(self):
-        """Learn ALL factors from 5 years of NASA historical data"""
-        
-        # Fetch 5 years of historical data for India center
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365 * CONFIG.HISTORICAL_YEARS)
-        
-        historical = self._fetch_historical_weather(start_date, end_date)
-        
-        if historical.empty:
-            logger.warning("No historical data available, using fallback learning")
-            self._learned_factors = self._get_fallback_factors()
-            return
-        
-        # Learn seasonal solar factors
-        solar_factors = self._learn_seasonal_solar_factors(historical)
-        
-        # Learn cloud penalty from regression
-        cloud_penalty = self._learn_cloud_penalty(historical)
-        
-        # Learn seasonal hydro factors
-        hydro_factors = self._learn_seasonal_hydro_factors(historical)
-        
-        # Learn wind location factors (for different regions)
-        wind_factors = self._learn_wind_location_factors()
-        
-        # Learn temperature-demand relationship
-        temp_demand_relationship = self._learn_temp_demand_relationship(historical)
-        
-        self._learned_factors = {
-            "built_at": datetime.now().isoformat(),
-            "solar_seasonal_factors": solar_factors,
-            "cloud_penalty": cloud_penalty,
-            "hydro_seasonal_factors": hydro_factors,
-            "wind_location_factors": wind_factors,
-            "temp_demand_relationship": temp_demand_relationship,
-            "historical_data_days": len(historical),
-        }
-        
-        logger.info(f"Learning complete. Cloud penalty: {cloud_penalty:.3f}")
-    
-    def _fetch_historical_weather(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-        """Fetch historical weather from NASA POWER"""
-        from NASAPowerClient import NASAPowerClient  # Local import to avoid circular
-        
-        try:
-            with NASAPowerClient() as client:
-                df = client.fetch_daily_data(
-                    CONFIG.INDIA_LAT, CONFIG.INDIA_LON, start_date, end_date
-                )
-            return df
-        except Exception as e:
-            logger.error(f"Failed to fetch historical weather: {e}")
-            return pd.DataFrame()
-    
-    def _learn_seasonal_solar_factors(self, historical_df: pd.DataFrame) -> Dict[int, float]:
-        """
-        Learn seasonal solar multipliers from historical data.
-        Returns dictionary: month -> solar_factor (1.0 = average)
-        NO manual numbers like 1.2 or 0.8.
-        """
-        if "solar_radiation" not in historical_df.columns:
-            return {m: 1.0 for m in range(1, 13)}
-        
-        # Group by month and calculate average solar radiation
-        historical_df["month"] = historical_df.index.month
-        monthly_avg = historical_df.groupby("month")["solar_radiation"].mean()
-        
-        # Calculate yearly average
-        yearly_avg = monthly_avg.mean()
-        
-        if yearly_avg <= 0:
-            return {m: 1.0 for m in range(1, 13)}
-        
-        # Seasonal factor = monthly_avg / yearly_avg
-        # This is LEARNED from actual data, not hardcoded
-        seasonal_factors = (monthly_avg / yearly_avg).to_dict()
-        
-        # Ensure all months have a factor
-        for month in range(1, 13):
-            if month not in seasonal_factors:
-                seasonal_factors[month] = 1.0
-        
-        logger.info(f"Learned solar seasonal factors: {seasonal_factors}")
-        return seasonal_factors
-    
-    def _learn_cloud_penalty(self, historical_df: pd.DataFrame) -> float:
-        """
-        Learn cloud penalty factor from relationship between cloud cover and solar radiation.
-        Uses linear regression on historical data. NO manual number like 0.7.
-        
-        Formula: solar_radiation = base - penalty * cloud_cover
-        Returns penalty factor (slope magnitude)
-        """
-        if "solar_radiation" not in historical_df.columns or "cloud_cover" not in historical_df.columns:
-            return 0.5  # Fallback
-        
-        # Clean data
-        valid = historical_df.dropna(subset=["solar_radiation", "cloud_cover"])
-        valid = valid[valid["solar_radiation"] > 0]
-        
-        if len(valid) < 30:  # Need enough samples
-            return 0.5
-        
-        X = valid["cloud_cover"].values.reshape(-1, 1)
-        y = valid["solar_radiation"].values
-        
-        # Linear regression to find relationship
-        model = LinearRegression()
-        model.fit(X, y)
-        
-        # Penalty = normalized slope (how much solar decreases per 1% cloud)
-        # Maximum possible penalty is when solar goes from max to 0 as cloud goes 0 to 100
-        max_possible_penalty = CONFIG.SOLAR_MAX / 100
-        
-        penalty = abs(model.coef_[0]) / max_possible_penalty
-        penalty = max(0.3, min(1.0, penalty))  # Clip to reasonable range
-        
-        logger.info(f"Learned cloud penalty from regression: {penalty:.3f} (R²: {model.score(X, y):.3f})")
-        return float(penalty)
-    
-    def _learn_seasonal_hydro_factors(self, historical_df: pd.DataFrame) -> Dict[int, float]:
-        """
-        Learn seasonal hydro multipliers from historical precipitation data.
-        Returns dictionary: month -> hydro_factor
-        NO manual number like 1.5 for monsoon.
-        """
-        if "precipitation" not in historical_df.columns:
-            return {m: 1.0 for m in range(1, 13)}
-        
-        # Group by month and calculate average precipitation
-        historical_df["month"] = historical_df.index.month
-        monthly_avg = historical_df.groupby("month")["precipitation"].mean()
-        
-        # Calculate yearly average
-        yearly_avg = monthly_avg.mean()
-        
-        if yearly_avg <= 0:
-            return {m: 1.0 for m in range(1, 13)}
-        
-        # Seasonal factor = monthly_avg / yearly_avg
-        hydro_factors = (monthly_avg / yearly_avg).to_dict()
-        
-        for month in range(1, 13):
-            if month not in hydro_factors:
-                hydro_factors[month] = 1.0
-        
-        logger.info(f"Learned hydro seasonal factors: {hydro_factors}")
-        return hydro_factors
-    
-    def _learn_wind_location_factors(self) -> Dict[str, float]:
-        """
-        Learn wind location factors by comparing local wind speeds to national average.
-        Fetches wind data for major Indian cities and compares to India center.
-        Returns dictionary: city -> wind_factor
-        """
-        city_coords = {
-            "Delhi": (28.6139, 77.2090),
-            "Mumbai": (19.0760, 72.8777),
-            "Chennai": (13.0827, 80.2707),
-            "Bengaluru": (12.9716, 77.5946),
-            "Kolkata": (22.5726, 88.3639),
-            "Hyderabad": (17.3850, 78.4867),
-            "Jaipur": (26.9124, 75.7873),
-            "Ahmedabad": (23.0225, 72.5714),
-        }
-        
-        wind_factors = {}
-        
-        try:
-            from NASAPowerClient import NASAPowerClient
-            
-            # Get national average wind speed (India center)
-            with NASAPowerClient() as client:
-                national_weather = client.fetch_daily_data(
-                    CONFIG.INDIA_LAT, CONFIG.INDIA_LON,
-                    datetime.now() - timedelta(days=365),
-                    datetime.now()
-                )
-                national_avg_wind = national_weather["wind_speed_10m"].mean() if not national_weather.empty else 4.0
-            
-            for city, (lat, lon) in city_coords.items():
-                try:
-                    with NASAPowerClient() as client:
-                        city_weather = client.fetch_daily_data(
-                            lat, lon,
-                            datetime.now() - timedelta(days=365),
-                            datetime.now()
-                        )
-                        city_avg_wind = city_weather["wind_speed_10m"].mean() if not city_weather.empty else national_avg_wind
-                    
-                    # Wind factor = city_avg / national_avg
-                    factor = city_avg_wind / national_avg_wind if national_avg_wind > 0 else 1.0
-                    wind_factors[city] = max(0.5, min(2.0, factor))  # Clip to reasonable range
-                    
-                except Exception as e:
-                    logger.warning(f"Could not learn wind factor for {city}: {e}")
-                    wind_factors[city] = 1.0
-            
-        except Exception as e:
-            logger.warning(f"Wind factor learning failed: {e}")
-            # Fallback to 1.0 for all cities
-            for city in city_coords.keys():
-                wind_factors[city] = 1.0
-        
-        logger.info(f"Learned wind location factors: {wind_factors}")
-        return wind_factors
-    
-    def _learn_temp_demand_relationship(self, historical_df: pd.DataFrame) -> Dict:
-        """
-        Learn relationship between temperature and electricity demand.
-        Returns cooling and heating coefficients learned from data.
-        """
-        # This would require demand data from Ember
-        # For now, return reasonable defaults
-        return {
-            "cooling_coefficient": 2.5,  # MW per degree above cooling base
-            "heating_coefficient": 1.8,  # MW per degree below heating base
-            "learned_from": "Ember demand data would improve this"
-        }
-    
-    def _get_fallback_factors(self) -> Dict:
-        """Fallback when no historical data available (still no manual numbers - uses physical defaults)"""
-        # These are physical defaults based on Earth's axial tilt, not manual guesses
-        # Solar radiation follows sine wave due to Earth's orbit - this is physics, not manual
-        months = np.arange(1, 13)
-        seasonal = np.sin(2 * np.pi * (months - 3) / 12)  # Peak in June
-        
-        solar_factors = {m: max(0.5, min(1.5, 1 + seasonal[i-1] * 0.5)) for i, m in enumerate(months, 1)}
-        
-        return {
-            "built_at": datetime.now().isoformat(),
-            "solar_seasonal_factors": solar_factors,
-            "cloud_penalty": 0.5,
-            "hydro_seasonal_factors": {m: 1.0 for m in range(1, 13)},
-            "wind_location_factors": {},
-            "temp_demand_relationship": {"cooling_coefficient": 2.5, "heating_coefficient": 1.8},
-            "historical_data_days": 0,
-            "is_fallback": True
-        }
-    
-    @property
-    def solar_seasonal_factors(self) -> Dict[int, float]:
-        return self._learned_factors.get("solar_seasonal_factors", {m: 1.0 for m in range(1, 13)})
-    
-    @property
-    def cloud_penalty(self) -> float:
-        return self._learned_factors.get("cloud_penalty", 0.5)
-    
-    @property
-    def hydro_seasonal_factors(self) -> Dict[int, float]:
-        return self._learned_factors.get("hydro_seasonal_factors", {m: 1.0 for m in range(1, 13)})
-    
-    @property
-    def wind_location_factors(self) -> Dict[str, float]:
-        return self._learned_factors.get("wind_location_factors", {})
-    
-    def get_wind_factor_for_city(self, city_name: str) -> float:
-        """Get learned wind factor for a specific city"""
-        return self.wind_location_factors.get(city_name, 1.0)
-
-# ============================================
-# SECTION 4: NASA POWER CLIENT
-# ============================================
-
-class NASAPowerClient:
-    """NASA POWER API client with caching"""
-    
-    PARAMETERS = {
-        "T2M": "temperature_2m",
-        "RH2M": "relative_humidity",
-        "WS10M": "wind_speed_10m",
-        "ALLSKY_SFC_SW_DWN": "solar_radiation",
-        "PRECTOTCORR": "precipitation",
-        "CLOUD_AMT": "cloud_cover",
+    current_year = datetime.now().year
+    params = {
+        "community":  NASA_POWER_COMMUNITY,
+        "longitude":  INDIA_LON,
+        "latitude":   INDIA_LAT,
+        "start":      f"{current_year - 5}0101",
+        "end":        f"{current_year - 1}1231",
+        "format":     NASA_POWER_FORMAT,
+        "parameters": "T2M,RH2M,WS10M,WS50M,ALLSKY_SFC_SW_DWN,PS",
     }
-    
+    try:
+        resp = requests.get(NASA_POWER_BASE_URL, params=params, timeout=45)
+        resp.raise_for_status()
+        raw = resp.json().get("properties", {}).get("parameter", {})
+        if not raw:
+            return {}
+
+        # Remove NASA POWER fill values (-999, -9999) and convert to arrays
+        def clean(key: str) -> np.ndarray:
+            vals = [float(v) for v in raw.get(key, {}).values()
+                    if v not in (-999, -9999, None) and not np.isnan(float(v))]
+            return np.array(vals) if vals else np.array([])
+
+        t2m  = clean("T2M")
+        rh   = clean("RH2M")
+        ws10 = clean("WS10M")
+        ws50 = clean("WS50M")
+        sol  = clean("ALLSKY_SFC_SW_DWN")
+        ps   = clean("PS")
+
+        if t2m.size == 0:
+            return {}
+
+        # Seasonal amplitude = half the monthly mean peak-to-trough range
+        day_idx     = np.arange(len(t2m))
+        month_bucket = ((day_idx % 365) / 365 * 12).astype(int).clip(0, 11)
+        monthly_t2m  = np.array([t2m[month_bucket == m].mean() for m in range(12)
+                                  if (month_bucket == m).any()])
+
+        return {
+            "base_temp":        round(float(t2m.mean()),  2),
+            "temp_amplitude":   round(float((monthly_t2m.max() - monthly_t2m.min()) / 2), 2)
+                                if monthly_t2m.size >= 2 else round(float(t2m.std()), 2),
+            "humidity":         round(float(rh.mean()),   2) if rh.size   else None,
+            "wind_speed_10m":   round(float(ws10.mean()), 2) if ws10.size else None,
+            "wind_speed_50m":   round(float(ws50.mean()), 2) if ws50.size else None,
+            "solar_radiation":  round(float(sol.mean()),  2) if sol.size  else None,
+            "surface_pressure": round(float(ps.mean()),   2) if ps.size   else None,
+        }
+    except Exception as e:
+        logger.warning(f"NASA POWER climatology fetch failed: {e}")
+        return {}
+
+
+def _fetch_ember_demand_stats() -> Dict:
+   
+    url    = "https://api.ember-energy.org/v1/electricity-generation/monthly"
+    params = {
+        "api_key":     "22a3271e-b37d-3f53-f084-1c5ffab5b64d",
+        "entity_code": "IND",
+        "start_date":  "2019-01-01",
+        "end_date":    datetime.now().strftime("%Y-%m-%d"),
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=45)
+        if resp.status_code != 200:
+            return {}
+
+        raw  = resp.json()
+        data = raw.get("data", []) if isinstance(raw, dict) else raw
+        if not data:
+            return {}
+
+        df = pd.DataFrame(data)
+        if "series" not in df.columns or "generation_twh" not in df.columns:
+            return {}
+
+        demand_mw = (df[df["series"] == "Demand"]["generation_twh"].dropna() * 1_000_000) / 730
+        if demand_mw.empty:
+            return {}
+
+        d_mean  = float(demand_mw.mean())
+        d_min   = float(demand_mw.min())
+        d_max   = float(demand_mw.max())
+        d_std   = float(demand_mw.std())
+        d_range = d_max - d_min
+
+        return {
+            "demand_base_mw":      round(d_mean),
+            "demand_floor_mw":     round(d_min  * 0.90),   # 10% below observed minimum
+            "demand_hourly_amp":   round(d_std   * 0.80),   # intra-day swing ≈ 80% of monthly σ
+            "demand_weekly_amp":   round(d_range * 0.12),   # weekday/weekend ≈ 12% of range
+            "demand_seasonal_amp": round(d_range * 0.22),   # seasonal swing  ≈ 22% of range
+        }
+    except Exception as e:
+        logger.warning(f"Ember demand stats fetch failed: {e}")
+        return {}
+
+
+def build_india_defaults() -> Dict:
+   
+    os.makedirs(os.path.dirname(_DEFAULTS_CACHE_PATH), exist_ok=True)
+
+    logger.info("Building INDIA_DEFAULTS from NASA POWER + Ember APIs...")
+    weather_stats = _fetch_nasa_climatology_stats()
+    demand_stats  = _fetch_ember_demand_stats()
+
+    if weather_stats and demand_stats:
+        combined = {k: v for k, v in {**weather_stats, **demand_stats}.items() if v is not None}
+        try:
+            with open(_DEFAULTS_CACHE_PATH, "w") as f:
+                json.dump({"built_at": datetime.now().isoformat(), "defaults": combined}, f, indent=2)
+            logger.info(f"INDIA_DEFAULTS cached → {_DEFAULTS_CACHE_PATH}")
+        except Exception as e:
+            logger.warning(f"Could not write defaults cache: {e}")
+        return combined
+
+    # At least one API failed — try the on-disk cache
+    logger.warning("API(s) unavailable — loading cached INDIA_DEFAULTS")
+    if os.path.exists(_DEFAULTS_CACHE_PATH):
+        try:
+            cached = json.load(open(_DEFAULTS_CACHE_PATH))
+            logger.info(f"Loaded cached INDIA_DEFAULTS (built {cached.get('built_at','?')})")
+            return cached["defaults"]
+        except Exception as e:
+            logger.error(f"Cache load failed: {e}")
+
+    # Partial success: use whichever API succeeded
+    partial = {k: v for k, v in {**weather_stats, **demand_stats}.items() if v is not None}
+    if partial:
+        logger.warning("Using partial INDIA_DEFAULTS from available API only")
+        return partial
+
+    raise RuntimeError(
+        "INDIA_DEFAULTS could not be built: both APIs failed and no cache exists at "
+        + _DEFAULTS_CACHE_PATH
+    )
+
+
+# Built once at import — all downstream code reads this dict
+INDIA_DEFAULTS: Dict = build_india_defaults()
+
+
+# ============================================
+# SHARED UTILITY
+# ============================================
+def _make_date_range(
+    start: Union[str, datetime],
+    end:   Union[str, datetime],
+    fmt:   str = "%Y%m%d",
+) -> Tuple[datetime, datetime]:
+    if isinstance(start, str): start = datetime.strptime(start, fmt)
+    if isinstance(end,   str): end   = datetime.strptime(end,   fmt)
+    return start, end
+
+
+# ============================================
+# SECTION 4: NASA POWER API CLIENT
+# ============================================
+class NASAPowerClient:
+    """
+    Handles all interactions with NASA POWER API.
+    Use as a context manager to ensure the HTTP session is closed:
+        with NASAPowerClient() as client:
+            df = client.fetch_daily_data(...)
+    """
+
+    PARAMETERS = {
+        "T2M":              "temperature_2m",
+        "T2M_MAX":          "temperature_max",
+        "T2M_MIN":          "temperature_min",
+        "RH2M":             "relative_humidity",
+        "WS10M":            "wind_speed_10m",
+        "WS50M":            "wind_speed_50m",
+        "ALLSKY_SFC_SW_DWN":"solar_radiation",
+        "PRECTOTCORR":      "precipitation",
+        "CLOUD_AMT":        "cloud_cover",
+        "PS":               "surface_pressure",
+    }
+
     def __init__(self):
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "ElectricityForecast/1.0"})
-        self.cache_dir = CONFIG.CACHE_DIR
-        ensure_cache_dir()
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self._session.close()
-    
-    def fetch_forecast(self, lat: float, lon: float, days: int = 30) -> pd.DataFrame:
-        """Fetch weather forecast"""
-        start = datetime.now()
-        end = start + timedelta(days=days)
-        return self._fetch_daily_data(lat, lon, start, end)
-    
-    def fetch_daily_data(self, lat: float, lon: float, start_date, end_date) -> pd.DataFrame:
-        """Fetch daily weather data"""
-        if isinstance(start_date, datetime):
-            start_date = start_date.strftime("%Y%m%d")
-        if isinstance(end_date, datetime):
-            end_date = end_date.strftime("%Y%m%d")
-        
+        self.base_url  = NASA_POWER_BASE_URL
+        self.community = NASA_POWER_COMMUNITY
+        self.format    = NASA_POWER_FORMAT
+        self.session   = requests.Session()
+        self.session.headers.update({"User-Agent": "ElectricityForecast/1.0"})
+
+    def __enter__(self):   return self
+    def __exit__(self, *_): self.session.close()
+
+    def fetch_daily_data(
+        self,
+        latitude:   float,
+        longitude:  float,
+        start_date: Union[str, datetime],
+        end_date:   Union[str, datetime],
+    ) -> pd.DataFrame:
+        """Fetch daily weather; falls back to INDIA_DEFAULTS-based synthetic on failure."""
+        if isinstance(start_date, datetime): start_date = start_date.strftime("%Y%m%d")
+        if isinstance(end_date,   datetime): end_date   = end_date.strftime("%Y%m%d")
+
         params = {
-            "community": CONFIG.NASA_COMMUNITY,
-            "longitude": lon,
-            "latitude": lat,
-            "start": start_date,
-            "end": end_date,
-            "format": CONFIG.NASA_FORMAT,
+            "community":  self.community,
+            "longitude":  longitude,
+            "latitude":   latitude,
+            "start":      start_date,
+            "end":        end_date,
+            "format":     self.format,
             "parameters": ",".join(self.PARAMETERS.keys()),
         }
-        
         try:
-            resp = self._session.get(CONFIG.NASA_POWER_URL, params=params, timeout=30)
+            resp = self.session.get(self.base_url, params=params, timeout=30)
             resp.raise_for_status()
-            return self._parse_response(resp.json())
+            return self._parse_api_response(resp.json())
         except Exception as e:
-            logger.warning(f"NASA POWER fetch failed: {e}")
-            return pd.DataFrame()
-    
-    def _parse_response(self, response: Dict) -> pd.DataFrame:
-        """Parse NASA response"""
-        data = response.get("properties", {}).get("parameter", {})
-        if not data:
-            return pd.DataFrame()
-        
-        dates = list(next(iter(data.values())).keys())
-        if not dates:
-            return pd.DataFrame()
-        
-        records = []
-        for d in dates:
-            record = {"datetime": pd.to_datetime(d, format="%Y%m%d")}
-            for api_key, col_name in self.PARAMETERS.items():
-                val = data.get(api_key, {}).get(d, np.nan)
-                if val in (-999, -9999):
-                    val = np.nan
-                record[col_name] = float(val) if val is not None else np.nan
-            records.append(record)
-        
-        return pd.DataFrame(records).set_index("datetime").sort_index()
+            logger.warning(f"NASA POWER fetch failed ({e}). Using computed-defaults fallback.")
+            return self._generate_fallback_data(start_date, end_date)
 
-# ============================================
-# SECTION 5: EMBER CLIENT
-# ============================================
-
-class EmberClient:
-    """Ember Energy API client"""
-    
-    def __init__(self):
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "ElectricityForecast/1.0"})
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self._session.close()
-    
-    def get_energy_mix(self, iso_code: str = "IND") -> Dict[str, float]:
-        """Get latest energy mix from Ember API"""
-        six_months_ago = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
-        
-        params = {
-            "api_key": CONFIG.EMBER_API_KEY,
-            "entity_code": iso_code,
-            "start_date": six_months_ago,
-            "end_date": datetime.now().strftime("%Y-%m-%d"),
-        }
-        
+    def fetch_current_weather(self, latitude: float, longitude: float) -> Dict:
+        """Get near-real-time weather (NASA POWER ~2-day latency)."""
+        end_dt   = datetime.now()
+        start_dt = end_dt - timedelta(days=3)
         try:
-            resp = self._session.get(CONFIG.EMBER_BASE_URL, params=params, timeout=30)
-            if resp.status_code != 200:
-                return self._empty_mix()
-            
-            data = resp.json().get("data", [])
-            if not data:
-                return self._empty_mix()
-            
-            df = pd.DataFrame(data)
-            latest = df[df["date"] == df["date"].max()]
-            latest = latest[latest.get("is_aggregate_series", True) == False]
-            
-            result = {}
-            for _, row in latest.iterrows():
-                series = row.get("series")
-                pct = row.get("share_of_generation_pct")
-                if series and pct is not None:
-                    result[series] = float(pct)
-            
-            if result:
-                result["thermal"] = result.get("Coal", 0) + result.get("Gas", 0)
-                result["renewable"] = sum(result.get(s, 0) for s in ["Solar", "Wind", "Hydro", "Bioenergy"])
-                result["is_real"] = True
-                return result
-            
-            return self._empty_mix()
-            
+            df = self.fetch_daily_data(latitude, longitude, start_dt, end_dt)
+            if not df.empty:
+                return df.iloc[-1].to_dict()
         except Exception as e:
-            logger.warning(f"Ember API failed: {e}")
-            return self._empty_mix()
-    
-    def _empty_mix(self) -> Dict:
-        """Empty mix when API fails - no hardcoded numbers"""
-        return {"is_real": False, "thermal": 0, "renewable": 0}
+            logger.warning(f"Current weather fetch failed: {e}")
+        return self._generate_fallback_weather()
 
-# ============================================
-# SECTION 6: ENERGY PREDICTOR - FULLY AUTOMATED
-# ============================================
+    def fetch_forecast(self, latitude: float, longitude: float, days: int = 90) -> pd.DataFrame:
+        """Get weather forecast for the next N days."""
+        start_dt = datetime.now()
+        return self.fetch_daily_data(latitude, longitude, start_dt, start_dt + timedelta(days=days))
 
-class EnergyPredictor:
-    """
-    Predicts all energy sources using LEARNED factors from historical data.
-    NO manual numbers - everything is learned or fetched from APIs.
-    """
-    
-    def __init__(self, nasa_client: NASAPowerClient, ember_client: EmberClient):
-        self.nasa = nasa_client
-        self.ember = ember_client
-        self.learner = DataLearner()  # Singleton with learned factors
-    
-    def predict_for_city(self, city_name: str, lat: float, lon: float, days: int = 30) -> pd.DataFrame:
-        """
-        Predict all energy sources for a city.
-        ALL values come from either:
-        - NASA API (weather forecast)
-        - Ember API (energy mix)
-        - Learned from historical data (seasonal factors, cloud penalty, wind factors)
-        """
-        logger.info(f"Predicting energy sources for {city_name} using learned factors")
-        
-        # Get REAL weather forecast from NASA
-        weather = self.nasa.fetch_forecast(lat, lon, days)
-        
-        if weather.empty:
-            logger.error(f"No weather data for {city_name}")
+    def fetch_climatology(self, latitude: float, longitude: float) -> pd.DataFrame:
+        """Monthly climatology from last 5 full years."""
+        yr = datetime.now().year
+        try:
+            df = self.fetch_daily_data(latitude, longitude, f"{yr-5}0101", f"{yr-1}1231")
+            if not df.empty:
+                df["month"] = df.index.month  # index is already DatetimeIndex
+                return df.groupby("month").mean(numeric_only=True)
+        except Exception as e:
+            logger.warning(f"Climatology fetch failed: {e}")
+        return self._generate_default_climatology()
+
+    # ── private helpers ───────────────────────────────────────────────────────
+    def _parse_api_response(self, response_json: Dict) -> pd.DataFrame:
+        """Convert NASA POWER JSON → tidy DataFrame indexed by date."""
+        try:
+            data = response_json.get("properties", {}).get("parameter", {})
+            if not data:
+                return pd.DataFrame()
+            dates = next(iter(data.values()), {}).keys()
+            if not dates:
+                return pd.DataFrame()
+            records = [
+                {"datetime": pd.to_datetime(d, format="%Y%m%d"),
+                 **{col: data.get(p, {}).get(d, np.nan)
+                    for p, col in self.PARAMETERS.items()}}
+                for d in dates
+            ]
+            return pd.DataFrame(records).set_index("datetime").sort_index()
+        except Exception as e:
+            logger.error(f"Failed to parse NASA POWER response: {e}")
             return pd.DataFrame()
-        
-        # Get REAL energy mix from Ember
-        energy_mix = self.ember.get_energy_mix("IND")
-        nuclear_pct = energy_mix.get("Nuclear", 0)
-        
-        # Get LEARNED factors (from historical data, NOT manual)
-        solar_factors = self.learner.solar_seasonal_factors
-        cloud_penalty = self.learner.cloud_penalty
-        hydro_factors = self.learner.hydro_seasonal_factors
-        wind_factor = self.learner.get_wind_factor_for_city(city_name)
-        
-        predictions = []
-        
-        for date, row in weather.iterrows():
-            # Get REAL values from NASA forecast
-            solar_rad = row.get("solar_radiation", 0)
-            cloud = row.get("cloud_cover", 0)
-            wind_speed = row.get("wind_speed_10m", 0)
-            rain = row.get("precipitation", 0)
-            month = date.month
-            
-            # Predict using LEARNED factors (no manual numbers)
-            solar_pct = self._predict_solar(
-                solar_rad, cloud, month, solar_factors, cloud_penalty
-            )
-            
-            wind_pct = self._predict_wind(
-                wind_speed, wind_factor
-            )
-            
-            hydro_pct = self._predict_hydro(
-                rain, month, hydro_factors
-            )
-            
-            # Nuclear from REAL Ember data
-            nuclear_pct_value = nuclear_pct if nuclear_pct > 0 else 0
-            
-            # Calculate totals
-            renewable_total = solar_pct + wind_pct + hydro_pct + nuclear_pct_value
-            thermal_pct = max(0, 100 - renewable_total)
-            
-            predictions.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "solar_percentage": round(solar_pct, 1),
-                "wind_percentage": round(wind_pct, 1),
-                "hydro_percentage": round(hydro_pct, 1),
-                "nuclear_percentage": round(nuclear_pct_value, 1),
-                "thermal_percentage": round(thermal_pct, 1),
-                "renewable_total": round(renewable_total, 1),
-                "temperature": round(row.get("temperature_2m", 0), 1),
-                "cloud_cover": round(cloud, 1),
-                "wind_speed": round(wind_speed, 1),
-                "rainfall": round(rain, 1),
-                "data_source_weather": "NASA POWER API (real forecast)",
-                "data_source_nuclear": "Ember Energy API (real historical)",
-                "solar_factor_used": round(solar_factors.get(month, 1.0), 3),
-                "wind_factor_used": round(wind_factor, 3),
-                "cloud_penalty_used": round(cloud_penalty, 3),
-            })
-        
-        return pd.DataFrame(predictions)
-    
-    def _predict_solar(self, solar_rad: float, cloud: float, month: int, 
-                       solar_factors: Dict, cloud_penalty: float) -> float:
-        """
-        Predict solar percentage using LEARNED factors.
-        NO manual numbers - all factors come from historical data.
-        """
-        if solar_rad <= 0:
-            return 0
-        
-        # Base from NASA radiation (normalized to max possible)
-        solar = (solar_rad / CONFIG.SOLAR_MAX) * 100
-        
-        # Apply LEARNED cloud penalty (from regression on historical data)
-        solar *= (1 - (cloud / 100) * cloud_penalty)
-        
-        # Apply LEARNED seasonal factor (from historical monthly averages)
-        seasonal_factor = solar_factors.get(month, 1.0)
-        solar *= seasonal_factor
-        
-        return min(100, max(0, solar))
-    
-    def _predict_wind(self, wind_speed: float, wind_factor: float) -> float:
-        """
-        Predict wind percentage using LEARNED location factor.
-        NO manual numbers - wind factor comes from historical comparison.
-        """
-        if wind_speed < CONFIG.WIND_CUT_IN or wind_speed > CONFIG.WIND_CUT_OUT:
-            return 0
-        
-        # Calculate efficiency based on turbine physics (IEC standard - universal)
-        if wind_speed <= CONFIG.WIND_OPTIMAL:
-            efficiency = (wind_speed - CONFIG.WIND_CUT_IN) / (CONFIG.WIND_OPTIMAL - CONFIG.WIND_CUT_IN)
-        else:
-            efficiency = 1 - (wind_speed - CONFIG.WIND_OPTIMAL) / (CONFIG.WIND_CUT_OUT - CONFIG.WIND_OPTIMAL)
-        
-        wind = efficiency * 100
-        
-        # Apply LEARNED location factor (from historical wind comparison)
-        wind *= wind_factor
-        
-        return min(100, max(0, wind))
-    
-    def _predict_hydro(self, rain: float, month: int, hydro_factors: Dict) -> float:
-        """
-        Predict hydro percentage using LEARNED seasonal factors.
-        NO manual numbers - hydro factors come from historical precipitation patterns.
-        """
-        # Base from rainfall (normalized)
-        hydro = min(100, rain * 5)
-        
-        # Apply LEARNED seasonal factor (from historical precipitation)
-        seasonal_factor = hydro_factors.get(month, 1.0)
-        hydro *= seasonal_factor
-        
-        return min(100, max(0, hydro))
 
-# ============================================
-# SECTION 7: MAIN PIPELINE
-# ============================================
+    def _generate_fallback_data(
+        self,
+        start_date: Union[str, datetime],
+        end_date:   Union[str, datetime],
+    ) -> pd.DataFrame:
+        start_date, end_date = _make_date_range(start_date, end_date)
+        date_range = pd.date_range(start=start_date, end=end_date, freq="D")
+        n        = len(date_range)
+        seasonal = np.sin(np.linspace(0, 2 * np.pi, n))
+        monsoon  = np.where((date_range.month >= 6) & (date_range.month <= 9), 15.0, 0.0)
 
-class DataPipeline:
-    """Main pipeline - fully automated with zero manual numbers"""
-    
-    def __init__(self):
-        self.nasa = NASAPowerClient()
-        self.ember = EmberClient()
-        self.energy_predictor = EnergyPredictor(self.nasa, self.ember)
-    
-    def get_weather_forecast(self, lat: float, lon: float, days: int = 30) -> pd.DataFrame:
-        """Get weather forecast from NASA (REAL data)"""
-        return self.nasa.fetch_forecast(lat, lon, days)
-    
-    def get_energy_mix(self) -> Dict:
-        """Get energy mix from Ember (REAL data)"""
-        return self.ember.get_energy_mix("IND")
-    
-    def predict_energy_sources(self, city_name: str, lat: float, lon: float, days: int = 30) -> pd.DataFrame:
-        """
-        Predict all energy sources for a city.
-        EVERY value comes from either:
-        - NASA API (real weather forecast)
-        - Ember API (real historical energy mix)
-        - Learned from historical data (seasonal factors, penalties, location factors)
-        
-        NO manual hardcoded numbers anywhere.
-        """
-        return self.energy_predictor.predict_for_city(city_name, lat, lon, days)
-    
-    def get_learned_factors(self) -> Dict:
-        """Get all factors learned from historical data"""
-        learner = DataLearner()
+        np.random.seed(42)
+        D = INDIA_DEFAULTS
+        return pd.DataFrame({
+            "temperature_2m":    D["base_temp"] + seasonal * D["temp_amplitude"]
+                                 + np.random.normal(0, 2, n),
+            "temperature_max":   D["base_temp"] + seasonal * D["temp_amplitude"] + 5
+                                 + np.random.normal(0, 1.5, n),
+            "temperature_min":   D["base_temp"] + seasonal * D["temp_amplitude"] - 5
+                                 + np.random.normal(0, 1.5, n),
+            "relative_humidity": np.clip(
+                D["humidity"] + seasonal * 15 + monsoon + np.random.normal(0, 8, n), 0, 100),
+            "wind_speed_10m":    np.maximum(0, D["wind_speed_10m"] + np.random.exponential(1.5, n)),
+            "wind_speed_50m":    np.maximum(0, D["wind_speed_50m"] + np.random.exponential(2.0, n)),
+            "solar_radiation":   np.maximum(0, D["solar_radiation"] + seasonal * 2
+                                 + np.random.normal(0, 1, n)),
+            "precipitation":     np.maximum(0, np.random.exponential(2, n)),
+            "cloud_cover":       np.clip(30 + seasonal * 20 + np.random.normal(0, 12, n), 0, 100),
+            "surface_pressure":  D["surface_pressure"] + np.random.normal(0, 5, n),
+        }, index=date_range)
+
+    def _generate_fallback_weather(self) -> Dict:
+        D = INDIA_DEFAULTS
         return {
-            "solar_seasonal_factors": learner.solar_seasonal_factors,
-            "cloud_penalty": learner.cloud_penalty,
-            "hydro_seasonal_factors": learner.hydro_seasonal_factors,
-            "wind_location_factors": learner.wind_location_factors,
+            "temperature_2m":    D["base_temp"],
+            "temperature_max":   D["base_temp"] + 5,
+            "temperature_min":   D["base_temp"] - 5,
+            "relative_humidity": D["humidity"],
+            "wind_speed_10m":    D["wind_speed_10m"],
+            "wind_speed_50m":    D["wind_speed_50m"],
+            "solar_radiation":   D["solar_radiation"],
+            "precipitation":     0.0,
+            "cloud_cover":       30.0,
+            "surface_pressure":  D["surface_pressure"],
         }
 
-# ============================================
-# SECTION 8: EXPORTS
-# ============================================
+    def _generate_default_climatology(self) -> pd.DataFrame:
+        """Monthly climatology table using INDIA_DEFAULTS (API-derived)."""
+        months   = np.arange(1, 13)
+        seasonal = np.sin(2 * np.pi * months / 12)
+        D = INDIA_DEFAULTS
+        return pd.DataFrame({
+            "temperature_2m":    D["base_temp"] + seasonal * D["temp_amplitude"],
+            "relative_humidity": D["humidity"]  + seasonal * 12,
+            "wind_speed_10m":    D["wind_speed_10m"] + np.random.uniform(-0.5, 0.5, 12),
+            "solar_radiation":   D["solar_radiation"] + seasonal * 1.5,
+        }, index=pd.Index(months, name="month"))
 
+
+# ============================================
+# SECTION 5: EMBER ENERGY API CLIENT
+# ============================================
+class EmberEnergyClient:
+
+    BASE_URL = "https://api.ember-energy.org/v1/electricity-generation/monthly"
+
+    def __init__(self, api_key: str = "22a3271e-b37d-3f53-f084-1c5ffab5b64d"):
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "ElectricityProject/1.0"})
+
+    def __enter__(self):    return self
+    def __exit__(self, *_): self.session.close()
+
+    def fetch_generation_mix(
+        self,
+        iso_code:   str = "IND",
+        start_date: str = "2021-01-01",
+        end_date:   str = "2026-12-31",
+    ) -> pd.DataFrame:
+        """Fetch monthly electricity generation data from Ember Energy API."""
+        params = {
+            "api_key":     self.api_key,
+            "entity_code": iso_code,
+            "start_date":  start_date,
+            "end_date":    end_date,
+        }
+        try:
+            resp = self.session.get(self.BASE_URL, params=params, timeout=30)
+            if resp.status_code != 200:
+                logger.error(f"Ember API returned HTTP {resp.status_code}")
+                return pd.DataFrame()
+            raw  = resp.json()
+            data = raw.get("data", []) if isinstance(raw, dict) else raw
+            if not data:
+                logger.warning("Empty data in Ember API response")
+                return pd.DataFrame()
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+        except Exception as e:
+            logger.error(f"Ember API fetch failed: {e}")
+            return pd.DataFrame()
+
+    def get_latest_mix_percentages(self, iso_code: str = "IND") -> Dict[str, float]:
+        """
+        Most recent month's fuel-mix share (%).
+        Fetches only last 6 months to minimise data transfer.
+        """
+        six_months_ago = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        df = self.fetch_generation_mix(iso_code, start_date=six_months_ago)
+        if df.empty:
+            return {}
+        latest = df[df["date"] == df["date"].max()]
+        if "is_aggregate_series" in latest.columns:
+            latest = latest[latest["is_aggregate_series"] == False]
+        if "series" not in latest.columns or "share_of_generation_pct" not in latest.columns:
+            logger.warning("Ember response missing expected columns")
+            return {}
+        return {r["series"]: r["share_of_generation_pct"] for _, r in latest.iterrows()}
+
+
+# ============================================
+# SECTION 6: FEATURE ENGINEERING
+# ============================================
+class FeatureEngineer:
+    """Creates all features needed for demand forecasting models."""
+
+    def __init__(self):
+        self.feature_list   = []
+        self.feature_config = {
+            "heating_base_temp": HEATING_BASE_TEMP,
+            "cooling_base_temp": COOLING_BASE_TEMP,
+            "wind_cut_in":       WIND_CUT_IN_SPEED,
+            "wind_cut_out":      WIND_CUT_OUT_SPEED,
+        }
+
+    def create_all_features(
+        self,
+        weather_df: pd.DataFrame,
+        demand_df:  Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """Complete feature engineering pipeline."""
+        df = weather_df.copy()
+        for fn in (self._add_temporal_features, self._add_cyclical_features,
+                   self._add_energy_features, self._add_rolling_features,
+                   self._add_interaction_features):
+            df = fn(df)
+        if demand_df is not None:
+            df = self._add_lag_features(df, demand_df)
+        self.feature_list = [c for c in df.columns if c not in ("datetime", "demand_mw")]
+        return df
+
+    def _add_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "datetime" in df.columns:
+                df = df.set_index(pd.to_datetime(df["datetime"]))
+
+        df["hour"]          = df.index.hour
+        df["day_of_week"]   = df.index.dayofweek
+        df["day_of_month"]  = df.index.day
+        df["month"]         = df.index.month
+        df["day_of_year"]   = df.index.dayofyear
+        df["week_of_year"]  = df.index.isocalendar().week.astype(int)
+        df["is_weekend"]    = (df["day_of_week"] >= 5).astype(int)
+        df["is_peak_hour"]  = (
+            ((df["hour"] >= 7) & (df["hour"] <= 9))
+            | ((df["hour"] >= 17) & (df["hour"] <= 21))
+        ).astype(int)
+        df["is_night"]      = ((df["hour"] >= 22) | (df["hour"] <= 5)).astype(int)
+        return self._add_holiday_features(df)
+
+    def _add_holiday_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        india_holidays = {
+            "01-01","01-26","08-15","10-02","12-25",
+            "01-14","03-08","04-02","04-10","04-14",
+            "05-01","08-19","09-17","10-20","11-01",
+        }
+        df["is_holiday"]         = df.index.strftime("%m-%d").isin(india_holidays).astype(int)
+        df["is_festival_season"] = ((df["month"] >= 10) | (df["month"] <= 1)).astype(int)
+        return df
+
+    def _add_cyclical_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for col, period in {"hour": 24, "day_of_week": 7, "month": 12, "day_of_year": 365}.items():
+            if col in df.columns:
+                df[f"{col}_sin"] = np.sin(2 * np.pi * df[col] / period)
+                df[f"{col}_cos"] = np.cos(2 * np.pi * df[col] / period)
+        return df
+
+    def _add_energy_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df  = df.copy()
+        cfg = self.feature_config
+        if "temperature_2m" in df.columns:
+            temp = df["temperature_2m"]
+            df["heating_degree"] = np.maximum(0, cfg["heating_base_temp"] - temp)
+            df["cooling_degree"] = np.maximum(0, temp - cfg["cooling_base_temp"])
+            df["temp_deviation"] = np.abs(
+                temp - (cfg["heating_base_temp"] + cfg["cooling_base_temp"]) / 2)
+            if "relative_humidity" in df.columns:
+                df["heat_index"] = temp + 0.5 * (df["relative_humidity"] - 50)
+            else:
+                df["heat_index"] = temp
+
+        if "relative_humidity" in df.columns:
+            df["humidity_deficit"] = 100 - df["relative_humidity"]
+            df["humidity_stress"]  = (df["relative_humidity"] > 70).astype(int)
+
+        if "wind_speed_10m" in df.columns:
+            wind = df["wind_speed_10m"]
+            ci, co = cfg["wind_cut_in"], cfg["wind_cut_out"]
+            df["wind_power_potential"] = np.where(
+                (wind >= ci) & (wind <= co), ((wind - ci) / (co - ci)) ** 3, 0)
+
+        if "solar_radiation" in df.columns:
+            df["solar_potential"] = df["solar_radiation"] / SOLAR_MAX * 100
+
+        if "temperature_2m" in df.columns and "relative_humidity" in df.columns:
+            df["temp_humidity_interaction"] = df["temperature_2m"] * df["relative_humidity"] / 100
+        return df
+
+    def _add_lag_features(self, df: pd.DataFrame, demand_df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if "demand_mw" not in demand_df.columns:
+            return df
+        demand_df = demand_df.copy()
+        if not isinstance(demand_df.index, pd.DatetimeIndex):
+            demand_df = demand_df.set_index(pd.to_datetime(demand_df["datetime"]))
+        common_idx = df.index.intersection(demand_df.index)
+        if len(common_idx) == 0:
+            return df
+        aligned = demand_df.loc[common_idx, "demand_mw"]
+        for lag in [1, 2, 3, 6, 12, 24, 48, 72, 168]:
+            df.loc[common_idx, f"demand_lag_{lag}h"] = aligned.shift(lag)
+        df.loc[common_idx, "demand_rolling_mean_24h"]  = aligned.rolling(24).mean()
+        df.loc[common_idx, "demand_rolling_std_24h"]   = aligned.rolling(24).std()
+        df.loc[common_idx, "demand_rolling_mean_168h"] = aligned.rolling(168).mean()
+        return df
+
+    def _add_rolling_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for col in ["temperature_2m", "relative_humidity", "wind_speed_10m"]:
+            if col in df.columns:
+                for w in [3, 7, 14, 30]:
+                    r = df[col].rolling(w, min_periods=1)
+                    df[f"{col}_ma_{w}d"]  = r.mean()
+                    df[f"{col}_std_{w}d"] = r.std()
+        return df
+
+    def _add_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if "temperature_2m" in df.columns and "hour" in df.columns:
+            df["temp_hour_interaction"] = df["temperature_2m"] * df["hour"]
+        if "temperature_2m" in df.columns and "is_peak_hour" in df.columns:
+            df["temp_peak_interaction"] = df["temperature_2m"] * df["is_peak_hour"]
+        if "wind_speed_10m" in df.columns and "cloud_cover" in df.columns:
+            df["wind_cloud_interaction"] = df["wind_speed_10m"] * (100 - df["cloud_cover"]) / 100
+        return df
+
+    def get_feature_names(self) -> List[str]:
+        return self.feature_list
+
+
+# ============================================
+# SECTION 7: DATA LOADER
+# ============================================
+class DataLoader:
+    """Load and preprocess electricity demand datasets."""
+
+    def __init__(self, data_dir: Optional[str] = None):
+        self.data_dir = data_dir or os.path.join(os.path.dirname(__file__), "data")
+        os.makedirs(self.data_dir, exist_ok=True)
+
+    def load_demand_data(
+        self,
+        filepath:    Optional[str] = None,
+        date_column: str = "datetime",
+    ) -> pd.DataFrame:
+        """Load from CSV → Ember API → synthetic (last resort)."""
+        if filepath and os.path.exists(filepath):
+            df = pd.read_csv(filepath, parse_dates=[date_column])
+        else:
+            logger.info("No local CSV — fetching from Ember API")
+            df = self.load_from_api("india")
+        return self.handle_missing_values(df.set_index(date_column).sort_index())
+
+    def load_from_api(self, region: str = "india") -> pd.DataFrame:
+        """Load real India demand from Ember Energy API."""
+        logger.info(f"Fetching real demand from Ember API for: {region}")
+        try:
+            with EmberEnergyClient() as client:
+                df = client.fetch_generation_mix("IND" if region.lower() == "india" else region)
+            if df.empty:
+                raise ValueError("Empty Ember response")
+            demand = df[df["series"] == "Demand"].copy()
+            if demand.empty:
+                raise ValueError("No 'Demand' series in Ember data")
+            demand["demand_mw"] = (demand["generation_twh"] * 1_000_000) / 730
+            return demand.rename(columns={"date": "datetime"})[["datetime", "demand_mw"]]
+        except Exception as e:
+            logger.error(f"Ember load failed ({e}) — using API-derived synthetic data")
+            return self._generate_synthetic_demand()
+
+    def _generate_synthetic_demand(self, days: int = 365) -> pd.DataFrame:
+        """
+        Last-resort hourly synthetic demand.
+        All values sourced from INDIA_DEFAULTS (computed from Ember API at startup).
+        """
+        dates = pd.date_range(
+            start=datetime.now() - timedelta(days=days), periods=days * 24, freq="h")
+        t  = np.arange(len(dates))
+        D  = INDIA_DEFAULTS
+        np.random.seed(42)
+        demand = np.maximum(
+            D["demand_floor_mw"],
+            D["demand_base_mw"]
+            + np.sin(2 * np.pi * t / 24)         * D["demand_hourly_amp"]
+            + np.sin(2 * np.pi * t / (24 * 7))   * D["demand_weekly_amp"]
+            + np.sin(2 * np.pi * t / (24 * 365)) * D["demand_seasonal_amp"]
+            + np.random.normal(0, D["demand_hourly_amp"] * 0.5, len(t))
+        )
+        return pd.DataFrame({"datetime": dates, "demand_mw": demand})
+
+    def resample_to_hourly(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Upsample to hourly using time interpolation (pandas ≥ 2.2 freq string 'h')."""
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        if df.index.freq is None or df.index.inferred_freq != "h":
+            df = df.resample("h").interpolate(method="time")
+        return df
+
+    def handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Time-interpolate then forward/back-fill residual NaNs (pandas ≥ 2.0 API)."""
+        df = df.copy()
+        missing = df.isnull().sum().sum()
+        if missing > 0:
+            logger.info(f"Filling {missing} missing values")
+            df = df.interpolate(method="time").ffill().bfill()
+        return df
+
+    def detect_outliers(self, df: pd.DataFrame, column: str = "demand_mw") -> pd.DataFrame:
+        """Flag values outside IQR 3× fence."""
+        if column not in df.columns:
+            return df
+        df = df.copy()
+        Q1, Q3 = df[column].quantile(0.25), df[column].quantile(0.75)
+        IQR = Q3 - Q1
+        df["is_outlier"] = (df[column] < Q1 - 3 * IQR) | (df[column] > Q3 + 3 * IQR)
+        n_out = df["is_outlier"].sum()
+        if n_out:
+            logger.warning(f"Detected {n_out} outliers in '{column}'")
+        return df
+
+    def split_train_val_test(
+        self, df: pd.DataFrame, train_ratio: float = 0.70, val_ratio: float = 0.15,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        n = len(df)
+        te = int(n * train_ratio)
+        ve = int(n * (train_ratio + val_ratio))
+        tr, va, te_df = df.iloc[:te], df.iloc[te:ve], df.iloc[ve:]
+        logger.info(f"Split → Train={len(tr)}, Val={len(va)}, Test={len(te_df)}")
+        return tr, va, te_df
+
+
+# ============================================
+# SECTION 8: DATA VALIDATOR
+# ============================================
+class DataValidator:
+    """Validate data quality before model training."""
+
+    def __init__(self):
+        self.validation_results = {}
+
+    def validate_weather_data(self, df: pd.DataFrame) -> Dict:
+        issues = []
+        for col, (lo, hi) in {
+            "temperature_2m":    (TEMP_MIN,       TEMP_MAX),
+            "relative_humidity": (HUMIDITY_MIN,   HUMIDITY_MAX),
+            "wind_speed_10m":    (WIND_SPEED_MIN, WIND_SPEED_MAX),
+            "solar_radiation":   (SOLAR_MIN,      SOLAR_MAX),
+        }.items():
+            if col in df.columns:
+                n = ((df[col] < lo) | (df[col] > hi)).sum()
+                if n: issues.append(f"{col} out of [{lo},{hi}]: {n} values")
+        return {"status": "PASS" if not issues else "FAIL",
+                "issues": issues, "total_records": len(df)}
+
+    def validate_demand_data(self, df: pd.DataFrame) -> Dict:
+        if "demand_mw" not in df.columns:
+            return {"status": "FAIL", "issues": ["No demand_mw column"], "quality_score": 0}
+        issues, quality = [], 100.0
+        neg = (df["demand_mw"] < 0).sum()
+        if neg:
+            issues.append(f"Negative demand: {neg} rows"); quality -= neg / len(df) * 100
+        zeros = (df["demand_mw"] == 0).sum()
+        if zeros > len(df) * 0.01:
+            issues.append(f"Excess zeros: {zeros} rows"); quality -= zeros / len(df) * 50
+        if len(df) > 1:
+            jumps = (df["demand_mw"].pct_change().abs() > 0.5).sum()
+            if jumps:
+                issues.append(f"Sudden >50% jumps: {jumps} rows"); quality -= jumps / len(df) * 100
+        return {"status": "PASS" if quality >= 80 else "FAIL",
+                "issues": issues, "quality_score": max(0.0, quality)}
+
+    def check_data_completeness(self, df: pd.DataFrame, expected_frequency: str = "h") -> Dict:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return {"status": "UNKNOWN", "completeness": 0, "gaps": []}
+        expected     = pd.date_range(df.index.min(), df.index.max(), freq=expected_frequency)
+        missing      = expected.difference(df.index)
+        completeness = len(df.index) / len(expected) if len(expected) else 0
+        return {
+            "status":        "PASS" if completeness >= MIN_COMPLETENESS_RATIO else "FAIL",
+            "completeness":  completeness,
+            "gaps":          list(missing[:10]),
+            "missing_count": len(missing),
+        }
+
+    def check_seasonal_consistency(self, df: pd.DataFrame) -> Dict:
+        """India: summer (Apr–Jun) demand should exceed winter (Dec–Feb) due to cooling load."""
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return {"status": "UNKNOWN", "anomalies": []}
+        monthly   = df.copy()
+        monthly["month"] = monthly.index.month
+        monthly   = monthly.groupby("month").mean(numeric_only=True)
+        anomalies = []
+        if "demand_mw" in monthly.columns:
+            summer = monthly.loc[monthly.index.isin([4, 5, 6]),  "demand_mw"].mean()
+            winter = monthly.loc[monthly.index.isin([12, 1, 2]), "demand_mw"].mean()
+            if summer < winter:
+                anomalies.append("India: summer demand expected >= winter (cooling load dominates)")
+        return {"status": "PASS" if not anomalies else "WARNING", "anomalies": anomalies}
+
+    def generate_quality_report(self, weather_df: pd.DataFrame, demand_df: pd.DataFrame) -> Dict:
+        report = {
+            "weather_validation":   self.validate_weather_data(weather_df),
+            "demand_validation":    self.validate_demand_data(demand_df),
+            "weather_completeness": self.check_data_completeness(weather_df),
+            "demand_completeness":  self.check_data_completeness(demand_df),
+            "seasonal_check":       self.check_seasonal_consistency(demand_df),
+        }
+        report["overall_score"] = (
+            report["weather_validation"].get("quality_score", 100)
+            + report["demand_validation"].get("quality_score", 100)
+            + report["weather_completeness"].get("completeness", 0) * 100
+            + report["demand_completeness"].get("completeness",  0) * 100
+        ) / 4
+        return report
+
+
+# ============================================
+# SECTION 9: DATA PIPELINE ORCHESTRATOR
+# ============================================
+class DataPipeline:
+    """Main orchestrator — single interface for all data operations."""
+
+    def __init__(self, cache_dir: Optional[str] = None):
+        self.weather_api      = NASAPowerClient()
+        self.feature_engineer = FeatureEngineer()
+        self.data_loader      = DataLoader()
+        self.validator        = DataValidator()
+        self.cache_dir        = cache_dir or os.path.join(os.path.dirname(__file__), "cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.scaler           = StandardScaler()
+
+    def prepare_training_data(
+        self,
+        lat:             float,
+        lon:             float,
+        start_date:      Union[str, datetime],
+        end_date:        Union[str, datetime],
+        demand_filepath: Optional[str] = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+        """Fetch → validate → engineer → return model-ready (X, y, feature_names)."""
+        logger.info("Preparing training data...")
+        weather_df = self.weather_api.fetch_daily_data(lat, lon, start_date, end_date)
+        demand_df  = self.data_loader.load_demand_data(demand_filepath)
+        logger.info(f"Fetched {len(weather_df)} weather + {len(demand_df)} demand records")
+
+        weather_df = self.data_loader.resample_to_hourly(weather_df)
+        quality    = self.validator.generate_quality_report(weather_df, demand_df)
+        logger.info(f"Data quality score: {quality['overall_score']:.1f}")
+
+        aligned     = self.align_weather_and_demand(weather_df, demand_df)
+        features_df = self.feature_engineer.create_all_features(aligned, demand_df).dropna()
+
+        names = self.feature_engineer.get_feature_names()
+        X     = features_df[names]
+        y     = features_df["demand_mw"] if "demand_mw" in features_df.columns else None
+        logger.info(f"Prepared {len(X)} samples × {len(names)} features")
+        return X, y, names
+
+    def prepare_forecast_data(
+        self,
+        lat:               float,
+        lon:               float,
+        forecast_days:     int = 7,
+        last_known_demand: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        """Prepare feature matrix for future prediction."""
+        logger.info(f"Preparing {forecast_days}-day forecast data...")
+        wf = self.feature_engineer.create_all_features(
+            self.weather_api.fetch_forecast(lat, lon, forecast_days))
+        if last_known_demand is not None and len(last_known_demand) > 0:
+            for lag in [24, 48, 168]:
+                if len(last_known_demand) >= lag:
+                    wf[f"demand_lag_{lag}h"] = last_known_demand.iloc[-lag]
+            wf["demand_rolling_mean_24h"]  = (
+                last_known_demand.iloc[-24:].mean()  if len(last_known_demand) >= 24
+                else last_known_demand.mean())
+            wf["demand_rolling_mean_168h"] = (
+                last_known_demand.iloc[-168:].mean() if len(last_known_demand) >= 168
+                else last_known_demand.mean())
+        names = self.feature_engineer.get_feature_names()
+        return wf[[f for f in names if f in wf.columns]].fillna(0)
+
+    def get_current_conditions(self, lat: float, lon: float) -> Dict:
+        w = self.weather_api.fetch_current_weather(lat, lon)
+        if "temperature_2m" in w:
+            w["heating_degree"] = max(0, HEATING_BASE_TEMP - w["temperature_2m"])
+            w["cooling_degree"] = max(0, w["temperature_2m"] - COOLING_BASE_TEMP)
+        return w
+
+    def align_weather_and_demand(
+        self, weather_df: pd.DataFrame, demand_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Align on common timestamps; copies inputs to avoid mutating caller data."""
+        weather_df, demand_df = weather_df.copy(), demand_df.copy()
+        for frame in (weather_df, demand_df):
+            if not isinstance(frame.index, pd.DatetimeIndex):
+                frame.index = pd.to_datetime(frame.index)
+        common = weather_df.index.intersection(demand_df.index)
+        if len(common) == 0:
+            logger.warning("No overlapping timestamps — aligning by position")
+            n = min(len(weather_df), len(demand_df))
+            out = weather_df.iloc[:n].copy()
+            out["demand_mw"] = demand_df["demand_mw"].iloc[:n].values
+            return out
+        return pd.concat(
+            [weather_df.loc[common], demand_df.loc[common, ["demand_mw"]]],
+            axis=1, join="inner")
+
+    def save_processed_data(self, df: pd.DataFrame, filename: str):
+        fp = os.path.join(self.cache_dir, f"{filename}.parquet")
+        df.to_parquet(fp)
+        logger.info(f"Saved → {fp}")
+
+    def load_processed_data(self, filename: str) -> Optional[pd.DataFrame]:
+        fp = os.path.join(self.cache_dir, f"{filename}.parquet")
+        if os.path.exists(fp):
+            logger.info(f"Loaded ← {fp}")
+            return pd.read_parquet(fp)
+        return None
+
+
+# ============================================
+# SECTION 10: HELPER FUNCTIONS
+# ============================================
+def validate_coordinates(lat: float, lon: float) -> bool:
+    return -90 <= lat <= 90 and -180 <= lon <= 180
+
+def get_timezone_from_coordinates(lat: float, lon: float) -> str:
+    return f"UTC{round(lon / 15):+d}"
+
+def calculate_season(month: int) -> str:
+    if month in (12, 1, 2):   return "Winter"
+    if month in (3, 4, 5):    return "Spring"
+    if month in (6, 7, 8, 9): return "Monsoon"
+    return "Post-Monsoon"
+
+def is_holiday(date: datetime, country: str = "India") -> bool:
+    return date in [datetime(date.year, m, d) for m, d in
+                    [(1,1),(1,26),(8,15),(10,2),(12,25)]]
+
+def get_default_parameters() -> Dict:
+    return {
+        "forecast_horizon_days": 7,
+        "feature_windows":       DEFAULT_ROLLING_WINDOWS,
+        "lag_periods":           DEFAULT_LAG_HOURS,
+        "validation_thresholds": {
+            "min_completeness": MIN_COMPLETENESS_RATIO,
+            "max_outliers":     MAX_ALLOWED_OUTLIERS,
+        },
+        "heating_base_temp": HEATING_BASE_TEMP,
+        "cooling_base_temp": COOLING_BASE_TEMP,
+    }
+
+
+# ============================================
+# SECTION 11: EXPORTS
+# ============================================
 __all__ = [
-    "Config", "CONFIG",
-    "NASAPowerClient", "EmberClient",
-    "DataLearner", "EnergyPredictor", "DataPipeline",
-    "setup_logger", "logger",
+    "NASAPowerClient", "EmberEnergyClient",
+    "FeatureEngineer", "DataLoader", "DataValidator", "DataPipeline",
+    "build_india_defaults", "INDIA_DEFAULTS",
+    "validate_coordinates", "calculate_season", "get_default_parameters",
+    "DataPipelineError", "APIFetchError", "DataValidationError", "MissingDataError",
 ]
