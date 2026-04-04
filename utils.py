@@ -1057,6 +1057,110 @@ class ExportHandler:
             mime=mime_type,
         )
 
+    def export_to_pdf(
+        self,
+        forecast_data: Dict,
+        metrics: Dict,
+        recommendations: List[Dict],
+        filename: str = "forecast_report.pdf",
+    ) -> bytes:
+        """Generate PDF report with forecast data and metrics"""
+        try:
+            from fpdf import FPDF
+            import os
+        except ImportError:
+            return b"PDF library not available"
+
+        class PDF(FPDF):
+            def header(self):
+                self.set_font("Arial", "B", 15)
+                self.cell(0, 10, "Electricity Demand Forecasting Report", 0, 1, "C")
+                self.ln(5)
+
+            def footer(self):
+                self.set_y(-15)
+                self.set_font("Arial", "I", 8)
+                self.cell(0, 10, f"Page {self.page_no()}", 0, 0, "C")
+
+        pdf = PDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=10)
+
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "1. Forecast Summary", 0, 1)
+        pdf.set_font("Arial", size=10)
+
+        if "date" in forecast_data:
+            pdf.cell(0, 8, f"Forecast Date: {forecast_data.get('date', 'N/A')}", 0, 1)
+
+        if "demand_mw" in forecast_data:
+            pdf.cell(
+                0,
+                8,
+                f"Predicted Demand: {forecast_data.get('demand_mw', 0):,.0f} MW",
+                0,
+                1,
+            )
+
+        if "temperature" in forecast_data:
+            pdf.cell(
+                0, 8, f"Temperature: {forecast_data.get('temperature', 0):.1f} °C", 0, 1
+            )
+
+        if "weather_condition" in forecast_data:
+            pdf.cell(
+                0, 8, f"Weather: {forecast_data.get('weather_condition', 'N/A')}", 0, 1
+            )
+
+        pdf.ln(5)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "2. Model Performance Metrics", 0, 1)
+        pdf.set_font("Arial", size=10)
+
+        metric_labels = {
+            "mape": "MAPE",
+            "rmse": "RMSE",
+            "mae": "MAE",
+            "r2": "R² Score",
+            "accuracy": "Accuracy",
+            "simple_accuracy": "Simple Accuracy",
+        }
+
+        for key, label in metric_labels.items():
+            if key in metrics:
+                value = metrics[key]
+                if key == "r2":
+                    pdf.cell(0, 8, f"{label}: {value:.4f}", 0, 1)
+                else:
+                    pdf.cell(0, 8, f"{label}: {value:.2f}", 0, 1)
+
+        pdf.ln(5)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "3. Recommendations", 0, 1)
+        pdf.set_font("Arial", size=10)
+
+        for i, rec in enumerate(recommendations[:5], 1):
+            title = rec.get("title", "N/A")
+            desc = rec.get("description", "")
+            priority = rec.get("priority", "")
+
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(0, 8, f"{i}. {title} [{priority}]", 0, 1)
+            pdf.set_font("Arial", size=9)
+            pdf.multi_cell(0, 6, desc)
+            pdf.ln(2)
+
+        pdf.ln(5)
+        pdf.set_font("Arial", "I", 8)
+        pdf.cell(
+            0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 0, 1
+        )
+
+        out = pdf.output(dest="S")
+        if isinstance(out, str):
+            return out.encode("latin-1")
+        return bytes(out)
+
 
 # ============================================
 # SECTION 8: GENERAL UTILITIES
