@@ -305,8 +305,15 @@ class NASAPowerClient:
             "surface_pressure": [1013.0] * n_days,
         }
 
+        if not data:
+            logger.warning("No data found in Ember API response")
+    # Return an empty DF with the expected column names to prevent UI crash
+        return pd.DataFrame(columns=["Date", "series", "generation_twh", "share_of_generation_pct"])
+
         df = pd.DataFrame(data)
-        df = df.set_index("datetime")
+        # Ensure the column name matches exactly what the UI/Plotly expects: "Date"
+        df = df.rename(columns={"date": "Date"}) 
+        df["Date"] = pd.to_datetime(df["Date"])
         return df
 
     def _generate_fallback_weather(self) -> Dict:
