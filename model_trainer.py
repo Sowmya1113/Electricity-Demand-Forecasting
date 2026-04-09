@@ -1271,12 +1271,12 @@ def train_all_models(
         target_col=target_col,
     )
 
-X_test, y_test = preprocessor.create_sequences(
-    test_df,
-    input_length=config["input_length"],
-    output_length=config["output_length"],
-    target_col=target_col,
-)
+    X_test, y_test = preprocessor.create_sequences(
+        test_df,
+        input_length=config["input_length"],
+        output_length=config["output_length"],
+        target_col=target_col,
+    )
 
     from torch.utils.data import DataLoader
 
@@ -1402,7 +1402,7 @@ X_test, y_test = preprocessor.create_sequences(
         patience=config["patience"],
     )
     results["ensemble"] = ensemble_result
-
+    results["ensemble"]["test_metrics"] = test_metrics
     checkpoint = ModelCheckpoint(save_dir)
 
     checkpoint.save_model(nhits_model, "nhits_model.pt", nhits_result)
