@@ -1011,25 +1011,6 @@ class ModelEvaluator:
     Comprehensive model evaluation
     PURPOSE: Verify >85% accuracy requirement
     """
-    def evaluate_on_test(model, test_loader, device):
-    model.eval()
-    
-    preds = []
-    actuals = []
-    
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch = X_batch.to(device)
-            
-            output = model(X_batch)
-            
-            preds.append(output.cpu().numpy())
-            actuals.append(y_batch.numpy())
-    
-    preds = np.concatenate(preds)
-    actuals = np.concatenate(actuals)
-    
-    return preds, actuals
 
     def __init__(self):
         self.metrics_history = []
@@ -1063,13 +1044,7 @@ class ModelEvaluator:
             "mae": mae,
             "mae_pct": mae_pct,
             "r2": r2,
-            metrics = {
-                "RMSE": test_metrics["rmse"],
-                "MAE": test_metrics["mae"],
-                "R2": test_metrics["r2"],
-                "MAPE": test_metrics["mape"],
-                "Accuracy (custom)": test_metrics["accuracy"]
-            },
+            "accuracy": combined_accuracy,
             "simple_accuracy": accuracy,
         }
 
@@ -1254,54 +1229,22 @@ def train_all_models(
 
     logger.info("Starting model training pipeline...")
 
-    # STEP 1: Time-based split FIRST
-    split_idx = int(len(data) * 0.8)
-    train_df = data.iloc[:split_idx].reset_index(drop=True)
-    test_df = data.iloc[split_idx:].reset_index(drop=True)
-    
-    # STEP 2: Fit scaler ONLY on train
     preprocessor = DataPreprocessor()
-    preprocessor.fit_scalers(train_df, target_col)
+    preprocessor.fit_scalers(data, target_col)
 
-    # Create sequences separately
-    X_train, y_train = preprocessor.create_sequences(
-        train_df,
+    X, y = preprocessor.create_sequences(
+        data,
         input_length=config["input_length"],
         output_length=config["output_length"],
         target_col=target_col,
     )
 
-    X_test, y_test = preprocessor.create_sequences(
-        test_df,
+    train_loader, val_loader, test_loader = preprocessor.create_dataloaders(
+        X,
+        y,
+        batch_size=config["batch_size"],
         input_length=config["input_length"],
         output_length=config["output_length"],
-        target_col=target_col,
-    )
-
-    from torch.utils.data import DataLoader
-
-    # Split train into train + val
-    val_split = int(len(X_train) * 0.85)
-    
-    X_tr, y_tr = X_train[:val_split], y_train[:val_split]
-    X_val, y_val = X_train[val_split:], y_train[val_split:]
-    
-    train_loader = DataLoader(
-        TimeSeriesDataset(X_tr, y_tr),
-        batch_size=config["batch_size"],
-        shuffle=False
-    )
-    
-    val_loader = DataLoader(
-        TimeSeriesDataset(X_val, y_val),
-        batch_size=config["batch_size"],
-        shuffle=False
-    )
-    
-    test_loader = DataLoader(
-        TimeSeriesDataset(X_test, y_test),
-        batch_size=config["batch_size"],
-        shuffle=False
     )
 
     results = {}
@@ -1357,13 +1300,6 @@ def train_all_models(
         epochs=config["max_epochs"],
         patience=config["patience"],
     )
-    # Test evaluation
-    preds, actuals = evaluate_on_test(nhits_model, test_loader, nhits_trainer.device)
-    
-    evaluator = ModelEvaluator()
-    test_metrics = evaluator.calculate_metrics(actuals, preds)
-    
-    results["nhits"]["test_metrics"] = test_metrics
     results["nhits"] = nhits_result
 
     logger.info("Training custom iTransformer model...")
@@ -1402,7 +1338,7 @@ def train_all_models(
         patience=config["patience"],
     )
     results["ensemble"] = ensemble_result
-    results["ensemble"]["test_metrics"] = test_metrics
+
     checkpoint = ModelCheckpoint(save_dir)
 
     checkpoint.save_model(nhits_model, "nhits_model.pt", nhits_result)
