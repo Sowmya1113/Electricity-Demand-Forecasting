@@ -653,37 +653,14 @@ class ElectricityForecastApp:
         metrics_json_path = os.path.join(
             os.path.dirname(__file__), "models", "metrics.json"
         )
-        @st.cache_data(ttl="1h", show_spinner=False)
-        def load_model_metrics(_self) -> Optional[Dict]:
-            """
-            Load REAL test metrics from trained model checkpoint
-            """
+        if os.path.exists(metrics_json_path):
             try:
-                import torch
-        
-                model_path = os.path.join(
-                    os.path.dirname(__file__), "models", "ensemble_model.pt"
-                )
-        
-                if os.path.exists(model_path):
-                    checkpoint = torch.load(model_path, map_location="cpu")
-        
-                    # 🔥 THIS IS THE IMPORTANT PART
-                    if "metrics" in checkpoint:
-                        metrics = checkpoint["metrics"]
-        
-                        return {
-                            "accuracy": metrics.get("accuracy", 0),
-                            "mape": metrics.get("mape", 0),
-                            "rmse": metrics.get("rmse", 0),
-                            "mae": metrics.get("mae", 0),
-                            "r2": metrics.get("r2", 0),
-                        }
-        
+                import json
+
+                with open(metrics_json_path, "r") as f:
+                    return json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load metrics: {e}")
-        
-            return None
+                logger.warning(f"Failed to load metrics.json: {e}")
 
         # Fallback to loading from Torch checkpoint if available
         try:
@@ -868,13 +845,7 @@ class ElectricityForecastApp:
             st.markdown("---")
             acc_col1, acc_col2, acc_col3, acc_col4, acc_col5 = st.columns(5)
             with acc_col1:
-                st.markdown("### 🎯 Model Performance (Test Data)")
-                
-                st.write(f"**Accuracy (custom):** {metrics.get('accuracy', 0):.1f}%")
-                st.write(f"**MAPE:** {metrics.get('mape', 0):.2f}%")
-                st.write(f"**RMSE:** {metrics.get('rmse', 0):.2f} MW")
-                st.write(f"**MAE:** {metrics.get('mae', 0):.2f} MW")
-                st.write(f"**R² Score:** {metrics.get('r2', 0):.4f}")            
+                st.markdown(f"### 🎯 Model Accuracy: {metrics.get('accuracy', 0):.1f}%")
             with acc_col2:
                 st.write(f"**MAPE:** {metrics.get('mape', 0):.2f}%")
             with acc_col3:
