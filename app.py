@@ -9,6 +9,7 @@ import sys
 import math
 import json
 import logging
+import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -24,7 +25,7 @@ from streamlit_option_menu import option_menu
 from data_pipeline import EmberEnergyClient
 
 st.set_page_config(
-    page_title="Electricity Demand Forecaster",
+    page_title="⚡ Electricity Demand Forecaster",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -42,6 +43,10 @@ LOCALITY_PROFILES = {
         "lng": 72.59,
         "temp_coef": 55,
         "wind_coef": 55,
+        "base_temp": 29,
+        "temp_range": 12,
+        "base_humidity": 45,
+        "base_wind": 12,
     },
     "Bengaluru, KA": {
         "base_demand": 8000,
@@ -50,6 +55,10 @@ LOCALITY_PROFILES = {
         "lng": 77.59,
         "temp_coef": 339,
         "wind_coef": 361,
+        "base_temp": 24,
+        "temp_range": 5,
+        "base_humidity": 62,
+        "base_wind": 14,
     },
     "Bhopal, MP": {
         "base_demand": 2500,
@@ -58,6 +67,10 @@ LOCALITY_PROFILES = {
         "lng": 77.41,
         "temp_coef": 30,
         "wind_coef": 28,
+        "base_temp": 26,
+        "temp_range": 14,
+        "base_humidity": 50,
+        "base_wind": 9,
     },
     "Chandigarh, CH": {
         "base_demand": 1800,
@@ -66,6 +79,10 @@ LOCALITY_PROFILES = {
         "lng": 76.79,
         "temp_coef": 18,
         "wind_coef": 8,
+        "base_temp": 23,
+        "temp_range": 16,
+        "base_humidity": 48,
+        "base_wind": 7,
     },
     "Chennai, TN": {
         "base_demand": 6000,
@@ -74,6 +91,10 @@ LOCALITY_PROFILES = {
         "lng": 80.27,
         "temp_coef": 314,
         "wind_coef": 7,
+        "base_temp": 30,
+        "temp_range": 6,
+        "base_humidity": 72,
+        "base_wind": 15,
     },
     "Coimbatore, TN": {
         "base_demand": 2800,
@@ -82,6 +103,10 @@ LOCALITY_PROFILES = {
         "lng": 76.96,
         "temp_coef": 241,
         "wind_coef": 368,
+        "base_temp": 27,
+        "temp_range": 5,
+        "base_humidity": 60,
+        "base_wind": 11,
     },
     "Delhi, DL": {
         "base_demand": 12000,
@@ -90,6 +115,10 @@ LOCALITY_PROFILES = {
         "lng": 77.21,
         "temp_coef": 109,
         "wind_coef": 60,
+        "base_temp": 25,
+        "temp_range": 18,
+        "base_humidity": 50,
+        "base_wind": 8,
     },
     "Hyderabad, TS": {
         "base_demand": 7000,
@@ -98,6 +127,10 @@ LOCALITY_PROFILES = {
         "lng": 78.49,
         "temp_coef": 142,
         "wind_coef": 151,
+        "base_temp": 27,
+        "temp_range": 8,
+        "base_humidity": 55,
+        "base_wind": 12,
     },
     "Indore, MP": {
         "base_demand": 2800,
@@ -106,6 +139,10 @@ LOCALITY_PROFILES = {
         "lng": 75.86,
         "temp_coef": 34,
         "wind_coef": 39,
+        "base_temp": 26,
+        "temp_range": 13,
+        "base_humidity": 48,
+        "base_wind": 10,
     },
     "Jaipur, RJ": {
         "base_demand": 4200,
@@ -114,6 +151,10 @@ LOCALITY_PROFILES = {
         "lng": 75.79,
         "temp_coef": 32,
         "wind_coef": 32,
+        "base_temp": 27,
+        "temp_range": 16,
+        "base_humidity": 38,
+        "base_wind": 11,
     },
     "Kochi, KL": {
         "base_demand": 2200,
@@ -122,6 +163,10 @@ LOCALITY_PROFILES = {
         "lng": 76.26,
         "temp_coef": 41,
         "wind_coef": 185,
+        "base_temp": 28,
+        "temp_range": 3,
+        "base_humidity": 78,
+        "base_wind": 13,
     },
     "Kolkata, WB": {
         "base_demand": 5500,
@@ -130,6 +175,10 @@ LOCALITY_PROFILES = {
         "lng": 88.36,
         "temp_coef": 74,
         "wind_coef": 82,
+        "base_temp": 27,
+        "temp_range": 10,
+        "base_humidity": 70,
+        "base_wind": 9,
     },
     "Lucknow, UP": {
         "base_demand": 4000,
@@ -138,6 +187,10 @@ LOCALITY_PROFILES = {
         "lng": 80.95,
         "temp_coef": 39,
         "wind_coef": 27,
+        "base_temp": 26,
+        "temp_range": 15,
+        "base_humidity": 55,
+        "base_wind": 8,
     },
     "Mumbai, MH": {
         "base_demand": 4500,
@@ -146,6 +199,10 @@ LOCALITY_PROFILES = {
         "lng": 72.88,
         "temp_coef": 101,
         "wind_coef": 116,
+        "base_temp": 28,
+        "temp_range": 5,
+        "base_humidity": 73,
+        "base_wind": 14,
     },
     "Nagpur, MH": {
         "base_demand": 3200,
@@ -154,6 +211,10 @@ LOCALITY_PROFILES = {
         "lng": 79.08,
         "temp_coef": 50,
         "wind_coef": 43,
+        "base_temp": 27,
+        "temp_range": 14,
+        "base_humidity": 48,
+        "base_wind": 9,
     },
     "Patna, BR": {
         "base_demand": 2500,
@@ -162,6 +223,10 @@ LOCALITY_PROFILES = {
         "lng": 85.1,
         "temp_coef": 24,
         "wind_coef": 24,
+        "base_temp": 26,
+        "temp_range": 14,
+        "base_humidity": 58,
+        "base_wind": 7,
     },
     "Pune, MH": {
         "base_demand": 5800,
@@ -170,6 +235,10 @@ LOCALITY_PROFILES = {
         "lng": 73.86,
         "temp_coef": 110,
         "wind_coef": 151,
+        "base_temp": 26,
+        "temp_range": 7,
+        "base_humidity": 55,
+        "base_wind": 12,
     },
     "Rajkot, GJ": {
         "base_demand": 2200,
@@ -178,6 +247,10 @@ LOCALITY_PROFILES = {
         "lng": 70.8,
         "temp_coef": 15,
         "wind_coef": 24,
+        "base_temp": 28,
+        "temp_range": 12,
+        "base_humidity": 42,
+        "base_wind": 13,
     },
     "Surat, GJ": {
         "base_demand": 3500,
@@ -186,6 +259,10 @@ LOCALITY_PROFILES = {
         "lng": 72.83,
         "temp_coef": 46,
         "wind_coef": 43,
+        "base_temp": 28,
+        "temp_range": 9,
+        "base_humidity": 58,
+        "base_wind": 12,
     },
     "Vadodara, GJ": {
         "base_demand": 3000,
@@ -194,6 +271,10 @@ LOCALITY_PROFILES = {
         "lng": 73.18,
         "temp_coef": 36,
         "wind_coef": 33,
+        "base_temp": 28,
+        "temp_range": 11,
+        "base_humidity": 50,
+        "base_wind": 10,
     },
 }
 
@@ -203,49 +284,163 @@ def seeded_random(seed: float) -> float:
     return x - math.floor(x)
 
 
-def generate_weather(locality: str, date: datetime, seed: int) -> Dict:
+def _condition_from_values(temperature: float, humidity: float, wind_speed: float) -> str:
+    """Derive a weather condition label from actual meteorological values."""
+    if wind_speed > 30:
+        return "stormy"
+    elif humidity > 80 and wind_speed > 15:
+        return "rainy"
+    elif humidity > 75:
+        return "cloudy"
+    elif wind_speed > 20:
+        return "windy"
+    else:
+        return "sunny"
+
+
+@st.cache_data(ttl="1h", show_spinner=False)
+def fetch_real_weather(locality: str) -> Dict:
+    """
+    Fetch ACTUAL current + 7-day forecast weather from Open-Meteo API
+    (free, no API key required) using the city's lat/lng coordinates.
+    Returns a dict with:
+      'current'  -> {temperature, humidity, wind_speed, weather_condition}
+      'forecast' -> list of 7 dicts (one per day), same structure
+    Falls back to a seasonally-adjusted estimate from the city profile on error.
+    """
     profile = LOCALITY_PROFILES.get(locality)
     if not profile:
-        return {
-            "temperature": 25,
-            "humidity": 60,
-            "wind_speed": 10,
-            "weather_condition": "sunny",
+        fallback = {"temperature": 25.0, "humidity": 60, "wind_speed": 10.0, "weather_condition": "sunny"}
+        return {"current": fallback, "forecast": [fallback] * 7}
+
+    lat, lng = profile["lat"], profile["lng"]
+
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lng,
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+            "daily": "temperature_2m_max,temperature_2m_min,relative_humidity_2m_max,wind_speed_10m_max",
+            "timezone": "Asia/Kolkata",
+            "forecast_days": 7,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # ── Current conditions ──────────────────────────────────────────
+        cur = data.get("current", {})
+        cur_temp = float(cur.get("temperature_2m", profile["base_temp"]))
+        cur_hum  = float(cur.get("relative_humidity_2m", profile["base_humidity"]))
+        cur_wind = float(cur.get("wind_speed_10m", profile["base_wind"]))
+        current = {
+            "temperature": round(cur_temp, 1),
+            "humidity":    min(100, max(0, round(cur_hum))),
+            "wind_speed":  max(0.0, round(cur_wind, 1)),
+            "weather_condition": _condition_from_values(cur_temp, cur_hum, cur_wind),
         }
 
+        # ── 7-day daily forecast ────────────────────────────────────────
+        daily = data.get("daily", {})
+        dates      = daily.get("time", [])
+        temps_max  = daily.get("temperature_2m_max", [])
+        temps_min  = daily.get("temperature_2m_min", [])
+        hums       = daily.get("relative_humidity_2m_max", [])
+        winds      = daily.get("wind_speed_10m_max", [])
+
+        forecast = []
+        for i in range(len(dates)):
+            t   = ((temps_max[i] if i < len(temps_max) else profile["base_temp"]) +
+                   (temps_min[i] if i < len(temps_min) else profile["base_temp"])) / 2
+            h   = float(hums[i])  if i < len(hums)  else float(profile["base_humidity"])
+            w   = float(winds[i]) if i < len(winds) else float(profile["base_wind"])
+            forecast.append({
+                "temperature": round(t, 1),
+                "humidity":    min(100, max(0, round(h))),
+                "wind_speed":  max(0.0, round(w, 1)),
+                "weather_condition": _condition_from_values(t, h, w),
+            })
+
+        logger.info(f"[Open-Meteo] Fetched real weather for {locality} ({lat},{lng})")
+        return {"current": current, "forecast": forecast if forecast else [current] * 7}
+
+    except Exception as exc:
+        logger.warning(f"[Open-Meteo] Failed for {locality}: {exc}. Using seasonal estimate.")
+        return _seasonal_weather_fallback(locality)
+
+
+def _seasonal_weather_fallback(locality: str) -> Dict:
+    """Profile-based seasonal estimate used when the API is unavailable."""
+    profile = LOCALITY_PROFILES.get(locality, {})
+    month = datetime.now().month
+    base_temp     = profile.get("base_temp", 25)
+    temp_range    = profile.get("temp_range", 10)
+    base_humidity = profile.get("base_humidity", 55)
+    base_wind     = profile.get("base_wind", 10)
+
+    seasonal_temp = math.sin(((month - 3) * math.pi) / 6) * temp_range
+    temperature   = round(base_temp + seasonal_temp, 1)
+    monsoon_humid = 20 if 5 <= month <= 8 else 0
+    humidity      = min(100, max(20, round(base_humidity + monsoon_humid)))
+    wind_speed    = round(base_wind, 1)
+
+    day_weather = {
+        "temperature": temperature,
+        "humidity": humidity,
+        "wind_speed": wind_speed,
+        "weather_condition": _condition_from_values(temperature, humidity, wind_speed),
+    }
+    return {"current": day_weather, "forecast": [day_weather] * 7}
+
+
+def generate_weather(locality: str, date: datetime, seed: int) -> Dict:
+    """
+    Return weather for a given date:
+    - Today / next 7 days → real Open-Meteo data per city
+    - Beyond 7 days       → seasonally-adjusted estimate from city profile
+    """
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    delta_days = (date.replace(hour=0, minute=0, second=0, microsecond=0) - today).days
+
+    if 0 <= delta_days < 7 and locality in LOCALITY_PROFILES:
+        real = fetch_real_weather(locality)
+        forecast_list = real.get("forecast", [])
+        idx = max(0, min(delta_days, len(forecast_list) - 1))
+        if forecast_list:
+            return forecast_list[idx]
+
+    # Beyond 7-day window → seasonal model
+    profile = LOCALITY_PROFILES.get(locality)
+    if not profile:
+        return {"temperature": 25, "humidity": 60, "wind_speed": 10, "weather_condition": "sunny"}
+
+    loc_hash = int(abs(profile["lat"] * 1000 + profile["lng"] * 7919)) % 100000
+    loc_seed = seed + loc_hash
+
     month = date.month
-    seasonal_temp = math.sin(((month - 3) * math.pi) / 6) * profile.get(
-        "temp_range", 10
-    )
-    temperature = (
-        profile.get("base_temp", 25) + seasonal_temp + (seeded_random(seed) - 0.5) * 6
-    )
+    base_temp     = profile.get("base_temp", 25)
+    temp_range    = profile.get("temp_range", 10)
+    base_humidity = profile.get("base_humidity", 55)
+    base_wind     = profile.get("base_wind", 10)
+
+    seasonal_temp = math.sin(((month - 3) * math.pi) / 6) * temp_range
+    temperature   = base_temp + seasonal_temp + (seeded_random(loc_seed) - 0.5) * 6
 
     monsoon_humid = 20 if 5 <= month <= 8 else 0
     humidity = (
-        55
+        base_humidity
         + monsoon_humid
         + math.sin((month * math.pi) / 3) * 15
-        + (seeded_random(seed + 1) - 0.5) * 20
+        + (seeded_random(loc_seed + 1) - 0.5) * 20
     )
-    wind_speed = 10 + (seeded_random(seed + 2) - 0.5) * 18
-
-    if wind_speed > 30:
-        weather_condition = "stormy"
-    elif humidity > 80 and wind_speed > 15:
-        weather_condition = "rainy"
-    elif humidity > 75:
-        weather_condition = "cloudy"
-    elif wind_speed > 20:
-        weather_condition = "windy"
-    else:
-        weather_condition = "sunny"
+    wind_speed = base_wind + (seeded_random(loc_seed + 2) - 0.5) * 18
 
     return {
         "temperature": round(temperature * 10) / 10,
-        "humidity": min(100, max(20, round(humidity))),
-        "wind_speed": max(0, round(wind_speed * 10) / 10),
-        "weather_condition": weather_condition,
+        "humidity":    min(100, max(20, round(humidity))),
+        "wind_speed":  max(0, round(wind_speed * 10) / 10),
+        "weather_condition": _condition_from_values(temperature, humidity, wind_speed),
     }
 
 
@@ -917,6 +1112,22 @@ class ElectricityForecastApp:
         with col2:
             st.subheader("🌤️ Weather Conditions")
 
+            # ── Show REAL current weather for the selected city ──────────
+            if locality in LOCALITY_PROFILES:
+                real_wx = fetch_real_weather(locality)
+                cur = real_wx.get("current", {})
+                icon_map = {"sunny": "☀️", "cloudy": "⛅", "rainy": "🌧️", "windy": "💨", "stormy": "⛈️"}
+                cond = cur.get("weather_condition", "sunny")
+                st.markdown(
+                    f"**🟢 Live — {locality}**  "
+                    f"{icon_map.get(cond, '🌡️')} **{cur.get('temperature', '--')}°C** "
+                    f"| 💧 {cur.get('humidity', '--')}% "
+                    f"| 🌬️ {cur.get('wind_speed', '--')} km/h"
+                )
+                st.caption("Source: Open-Meteo API (real-time)")
+                st.markdown("---")
+
+            # ── Forecast weather strip (next 3 days) ─────────────────────
             if predictions:
                 for i, pred in enumerate(predictions[:3]):
                     with st.container():
