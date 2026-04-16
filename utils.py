@@ -103,9 +103,6 @@ class EnergyMixCalculator:
         self.hydro_efficiency = HYDRO_EFFICIENCY
 
         self.default_mix = {
-            "UK": {"solar": 0.08, "wind": 0.25, "hydro": 0.02, "thermal": 0.65},
-            "US": {"solar": 0.08, "wind": 0.10, "hydro": 0.02, "thermal": 0.80},
-            "EU": {"solar": 0.12, "wind": 0.22, "hydro": 0.10, "thermal": 0.56},
             "India": {"solar": 0.15, "wind": 0.08, "hydro": 0.12, "thermal": 0.65},
         }
 
