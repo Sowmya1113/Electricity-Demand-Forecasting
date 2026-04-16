@@ -115,11 +115,11 @@ class EnergyMixCalculator:
         """
         Calculate generation percentages for next period
         """
-        cloud_cover = weather_data.get("cloud_cover", 50)
-        wind_speed = weather_data.get("wind_speed_10m", 5)
-        solar_radiation = weather_data.get("solar_radiation", 5)
-        hour = weather_data.get("hour", 12)
-        month = weather_data.get("month", 6)
+        cloud_cover = weather_data.get("cloud_cover")
+        wind_speed = weather_data.get("wind_speed_10m")
+        solar_radiation = weather_data.get("solar_radiation")
+        hour = weather_data.get("hour")
+        month = weather_data.get("month")
 
         solar = self._calculate_solar_factor(cloud_cover, solar_radiation, hour, month)
         wind = self._calculate_wind_factor(wind_speed)
