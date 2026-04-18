@@ -782,60 +782,14 @@ class EnsembleForecaster(nn.Module):
 # SECTION 5: TRAINING MANAGER
 # ============================================
 class ModelTrainer:
-    """
-    Handles training, validation, and checkpointing
-    PURPOSE: Train models to achieve >85% accuracy
-    """
-
-    def __init__(
-        self,
-        model: Optional[nn.Module] = None,
-        learning_rate: float = 0.0005,
-        device: str = "cuda",
-        weight_decay: float = 0.01,
-    ):
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.model = model
-        self.optimizer = None
-        self.scheduler = None
-        self.history = {"train_loss": [], "val_loss": []}
-
-        if model is not None:
-            self.model.to(self.device)
-            self.optimizer = optim.AdamW(
-                model.parameters(), lr=learning_rate, weight_decay=weight_decay
-            )
-            self.scheduler = optim.lr_scheduler.OneCycleLR(
-                self.optimizer, max_lr=learning_rate, epochs=100, steps_per_epoch=100
-            )
-
-    def train_epoch(self, train_loader: DataLoader) -> float:
-        """Train for one epoch"""
-        self.model.train()
-        total_loss = 0
-
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(self.device)
-            y_batch = y_batch.to(self.device)
-
-            self.optimizer.zero_grad()
-
-            output = self.model(X_batch)
-
-            loss = nn.functional.huber_loss(output, y_batch, delta=1.0)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-
-            total_loss += loss.item()
-
-        return total_loss / len(train_loader)
+    def __init__(self, model, learning_rate, target_scaler=None):
+        # ... other init code ...
+        self.target_scaler = target_scaler   # Store scaler for evaluation
 
     def validate(self, val_loader: DataLoader) -> Dict:
-        """Validate model performance"""
+        """Validate and return metrics in original MW scale."""
         self.model.eval()
-        total_loss = 0
+        total_loss = 0.0
         all_preds = []
         all_targets = []
 
@@ -846,119 +800,21 @@ class ModelTrainer:
 
                 output = self.model(X_batch)
                 loss = nn.functional.mse_loss(output, y_batch)
-
                 total_loss += loss.item()
+
                 all_preds.append(output.cpu().numpy())
                 all_targets.append(y_batch.cpu().numpy())
 
         avg_loss = total_loss / len(val_loader)
-
         all_preds = np.concatenate(all_preds)
         all_targets = np.concatenate(all_targets)
 
-        metrics = {
-            "loss": avg_loss,
-            "mae": mean_absolute_error(all_targets, all_preds),
-            "rmse": np.sqrt(mean_squared_error(all_targets, all_preds)),
-            "mape": mean_absolute_percentage_error(all_targets, all_preds) * 100,
-            "r2": r2_score(all_targets, all_preds),
-        }
+        # Use ModelEvaluator with scaler to get correct metrics
+        evaluator = ModelEvaluator(target_scaler=self.target_scaler)
+        metrics = evaluator.calculate_metrics(all_targets, all_preds)
+        metrics["loss"] = avg_loss
 
         return metrics
-
-    def train(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        epochs: int = 100,
-        patience: int = 10,
-        save_path: Optional[str] = None,
-    ) -> Dict:
-        """Complete training loop with early stopping"""
-        best_val_loss = float("inf")
-        patience_counter = 0
-        best_model_state = None
-
-        for epoch in range(epochs):
-            train_loss = self.train_epoch(train_loader)
-            val_metrics = self.validate(val_loader)
-            val_loss = val_metrics["loss"]
-
-            self.history["train_loss"].append(train_loss)
-            self.history["val_loss"].append(val_loss)
-
-            if self.scheduler is not None:
-                try:
-                    self.scheduler.step()
-                except:
-                    pass
-
-            logger.info(
-                f"Epoch {epoch + 1}/{epochs} - "
-                f"Train Loss: {train_loss:.4f}, "
-                f"Val Loss: {val_loss:.4f}, "
-                f"Val MAPE: {val_metrics['mape']:.2f}%"
-            )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                best_model_state = self.model.state_dict().copy()
-
-                if save_path:
-                    self.save_checkpoint(save_path, epoch, val_metrics)
-            else:
-                patience_counter += 1
-
-            if patience_counter >= patience:
-                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                break
-
-        if best_model_state is not None:
-            self.model.load_state_dict(best_model_state)
-
-        return {
-            "best_val_loss": best_val_loss,
-            "epochs_trained": epoch + 1,
-            "history": self.history,
-        }
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions"""
-        self.model.eval()
-
-        X_tensor = torch.FloatTensor(X).to(self.device)
-
-        with torch.no_grad():
-            predictions = self.model(X_tensor)
-
-        return predictions.cpu().numpy()
-
-    def save_checkpoint(self, filepath: str, epoch: int, metrics: Dict):
-        """Save training checkpoint"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "metrics": metrics,
-            "history": self.history,
-        }
-
-        torch.save(checkpoint, filepath)
-        logger.info(f"Saved checkpoint to {filepath}")
-
-    def load_checkpoint(self, filepath: str) -> Dict:
-        """Load training checkpoint"""
-        checkpoint = torch.load(filepath, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.history = checkpoint.get("history", {"train_loss": [], "val_loss": []})
-
-        return checkpoint
-
 
 # ============================================
 # SECTION 6: LOSS FUNCTIONS
@@ -1008,112 +864,78 @@ class QuantileLoss(nn.Module):
 # ============================================
 class ModelEvaluator:
     """
-    Comprehensive model evaluation
-    PURPOSE: Verify >85% accuracy requirement
+    Comprehensive model evaluation on original MW scale
+    PURPOSE: Ensure metrics reflect real-world accuracy
     """
 
-    def __init__(self):
+    def __init__(self, target_scaler: Optional[StandardScaler] = None):
+        """
+        Args:
+            target_scaler: Fitted scaler used to inverse-transform predictions.
+                          If None, assumes data is already in original scale.
+        """
+        self.target_scaler = target_scaler
         self.metrics_history = []
 
     def calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict:
-        """Calculate all accuracy metrics"""
+        """
+        Calculate all accuracy metrics on ORIGINAL MW scale.
+        If target_scaler is provided, y_true and y_pred should be scaled,
+        and will be inverse-transformed before metric calculation.
+        """
+        # Inverse transform if scaler is available
+        if self.target_scaler is not None:
+            y_true = self.target_scaler.inverse_transform(y_true.reshape(-1, 1)).flatten()
+            y_pred = self.target_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
+
         y_true = y_true.flatten()
         y_pred = y_pred.flatten()
 
-        mape = mean_absolute_percentage_error(y_true, y_pred) * 100
+        # Avoid division by zero in MAPE
+        mask = y_true != 0
+        if mask.sum() == 0:
+            mape = 0.0
+        else:
+            mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
 
-        r2 = r2_score(y_true, y_pred)
+        # R² Score
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
 
+        # MAE and RMSE
         mae = mean_absolute_error(y_true, y_pred)
-        mean_true = np.mean(y_true)
-        mae_pct = (mae / mean_true) * 100 if mean_true > 0 else 100
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
 
-        smape = np.mean(
-            200 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)
-        )
+        # Symmetric MAPE (SMAPE)
+        smape = np.mean(200 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + 1e-8))
 
-        accuracy = max(0, 100 - mape)
-        r2_based_accuracy = max(0, min(100, r2 * 100))
+        # Accuracy derived from MAPE
+        simple_accuracy = max(0.0, 100 - mape)
 
-        combined_accuracy = (accuracy * 0.6) + (r2_based_accuracy * 0.4)
+        # Combined accuracy (weighted with R²)
+        r2_based_accuracy = max(0.0, min(100.0, r2 * 100))
+        combined_accuracy = (simple_accuracy * 0.6) + (r2_based_accuracy * 0.4)
 
         metrics = {
-            "mape": mape,
-            "smape": smape,
-            "rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
-            "mae": mae,
-            "mae_pct": mae_pct,
-            "r2": r2,
-            "accuracy": combined_accuracy,
-            "simple_accuracy": accuracy,
+            "mae": round(mae, 2),
+            "rmse": round(rmse, 2),
+            "mape": round(mape, 2),
+            "smape": round(smape, 2),
+            "r2": round(r2, 4),
+            "accuracy": round(combined_accuracy, 2),
+            "simple_accuracy": round(simple_accuracy, 2)
         }
 
         self.metrics_history.append(metrics)
-
         return metrics
 
-    def check_accuracy_threshold(
-        self, metrics: Dict, threshold: float = 85.0
-    ) -> Tuple[bool, str]:
-        """Verify if model meets accuracy requirement"""
-        accuracy = metrics.get("accuracy", 0)
-
-        if accuracy >= threshold:
-            return True, f"Model passes threshold: {accuracy:.1f}% >= {threshold}%"
-
-        return False, f"Model below threshold: {accuracy:.1f}% < {threshold}%"
-
-    def hourly_breakdown_accuracy(
-        self, y_true: np.ndarray, y_pred: np.ndarray, dates: pd.DatetimeIndex
-    ) -> Dict[int, float]:
-        """Calculate accuracy for each hour of day"""
-        hourly_mape = {}
-
-        hours = (
-            pd.DatetimeIndex(dates).hour
-            if hasattr(dates, "hour")
-            else np.arange(len(y_true)) % 24
-        )
-
-        for hour in range(24):
-            mask = hours == hour
-
-            if mask.sum() > 0:
-                hour_mape = (
-                    mean_absolute_percentage_error(y_true[mask], y_pred[mask]) * 100
-                )
-                hourly_mape[hour] = hour_mape
-
-        return hourly_mape
-
-    def seasonal_accuracy(
-        self, y_true: np.ndarray, y_pred: np.ndarray, dates: pd.DatetimeIndex
-    ) -> Dict[str, float]:
-        """Calculate accuracy by season"""
-        if hasattr(dates, "month"):
-            months = dates.month
-        else:
-            months = np.arange(len(y_true)) % 12 + 1
-
-        seasons = {
-            "Winter": [12, 1, 2],
-            "Spring": [3, 4, 5],
-            "Summer": [6, 7, 8],
-            "Fall": [9, 10, 11],
-        }
-
-        seasonal_mape = {}
-
-        for season, months_list in seasons.items():
-            mask = np.isin(months, months_list)
-
-            if mask.sum() > 0:
-                season_mape = (
-                    mean_absolute_percentage_error(y_true[mask], y_pred[mask]) * 100
-                )
-                seasonal_mape[season] = season_mape
-
-        return seasonal_mape
+    def check_accuracy_threshold(self, metrics: Dict, threshold: float = 85.0) -> Tuple[bool, str]:
+        """Verify if model meets the required accuracy threshold."""
+        acc = metrics.get("accuracy", 0)
+        if acc >= threshold:
+            return True, f"✅ PASS: {acc:.2f}% >= {threshold}%"
+        return False, f"❌ FAIL: {acc:.2f}% < {threshold}%"
 
 
 # ============================================
@@ -1215,142 +1037,18 @@ class HyperparameterOptimizer:
 # ============================================
 # SECTION 11: MAIN TRAINING SCRIPT
 # ============================================
-def train_all_models(
-    data: pd.DataFrame,
-    target_col: str = "demand_mw",
-    save_dir: str = "models/",
-    config: Dict = None,
-) -> Dict[str, Any]:
-    """
-    Complete training pipeline for all models
-    CALLED BY: app.py when models don't exist
-    """
-    config = config or DEFAULT_CONFIG
-
-    logger.info("Starting model training pipeline...")
-
+def train_all_models(data, target_col="demand_mw", ...):
     preprocessor = DataPreprocessor()
-    preprocessor.fit_scalers(data, target_col)
+    preprocessor.fit_scalers(train_data, target_col)
 
-    X, y = preprocessor.create_sequences(
-        data,
-        input_length=config["input_length"],
-        output_length=config["output_length"],
-        target_col=target_col,
+    # ... create dataloaders ...
+
+    # Trainer with target scaler for correct metric reporting
+    trainer = ModelTrainer(
+        model,
+        learning_rate=config["learning_rate"],
+        target_scaler=preprocessor.target_scaler
     )
-
-    train_loader, val_loader, test_loader = preprocessor.create_dataloaders(
-        X,
-        y,
-        batch_size=config["batch_size"],
-        input_length=config["input_length"],
-        output_length=config["output_length"],
-    )
-
-    results = {}
-
-    feature_cols = [c for c in data.columns if c != target_col]
-    n_features = len(feature_cols) if feature_cols else 1
-
-    if NEURALFORECAST_AVAILABLE:
-        logger.info("Training NeuralForecast models...")
-
-        from data_pipeline import DataPipeline
-
-        pipeline = DataPipeline()
-
-        try:
-            nf = NeuralForecast(
-                models=[
-                    NHITS(
-                        h=config["output_length"],
-                        input_size=config["input_length"],
-                        learning_rate=config["learning_rate"],
-                        max_epochs=config["max_epochs"],
-                        early_stop_patience=config["patience"],
-                    )
-                ]
-            )
-
-            df_nf = pipeline.prepare_data_for_neuralforecast(data, target_col)
-
-            train_size = int(len(df_nf) * 0.8)
-            nf.fit(df=df_nf.iloc[:train_size], verbose=False)
-
-            preds = nf.predict(
-                df_nf.iloc[train_size : train_size + config["output_length"]]
-            )
-
-            results["neuralforecast"] = {"status": "success", "predictions": preds}
-
-        except Exception as e:
-            logger.warning(f"NeuralForecast training failed: {e}")
-            results["neuralforecast"] = {"status": "failed", "error": str(e)}
-
-    logger.info("Training custom NHiTS model...")
-    nhits_model = NHiTSModel(
-        input_length=config["input_length"],
-        output_length=config["output_length"],
-        hidden_dim=config["hidden_dim"],
-    )
-    nhits_trainer = ModelTrainer(nhits_model, learning_rate=config["learning_rate"])
-    nhits_result = nhits_trainer.train(
-        train_loader,
-        val_loader,
-        epochs=config["max_epochs"],
-        patience=config["patience"],
-    )
-    results["nhits"] = nhits_result
-
-    logger.info("Training custom iTransformer model...")
-    itransformer_model = iTransformer(
-        variate_num=n_features,
-        input_len=config["input_length"],
-        pred_len=config["output_length"],
-        d_model=config["d_model"],
-        n_heads=config["n_heads"],
-        n_layers=config["n_layers"],
-    )
-    itransformer_trainer = ModelTrainer(
-        itransformer_model, learning_rate=config["learning_rate"]
-    )
-    itransformer_result = itransformer_trainer.train(
-        train_loader,
-        val_loader,
-        epochs=config["max_epochs"],
-        patience=config["patience"],
-    )
-    results["itransformer"] = itransformer_result
-
-    logger.info("Training ensemble model...")
-    ensemble_model = EnsembleForecaster(
-        input_length=config["input_length"],
-        output_length=config["output_length"],
-        n_features=n_features,
-    )
-    ensemble_trainer = ModelTrainer(
-        ensemble_model, learning_rate=config["learning_rate"]
-    )
-    ensemble_result = ensemble_trainer.train(
-        train_loader,
-        val_loader,
-        epochs=config["max_epochs"],
-        patience=config["patience"],
-    )
-    results["ensemble"] = ensemble_result
-
-    checkpoint = ModelCheckpoint(save_dir)
-
-    checkpoint.save_model(nhits_model, "nhits_model.pt", nhits_result)
-    checkpoint.save_model(
-        itransformer_model, "itransformer_model.pt", itransformer_result
-    )
-    checkpoint.save_model(ensemble_model, "ensemble_model.pt", ensemble_result)
-
-    logger.info("Training pipeline complete!")
-
-    return results
-
 
 def main():
     """Entry point for training from command line"""
