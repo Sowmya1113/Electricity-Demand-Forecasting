@@ -1544,8 +1544,6 @@ class ElectricityForecastApp:
                 st.write(f"• {city}")
 
         st.markdown("---")
-        st.caption("Built with ❤️ using Streamlit and PyTorch")
-
 
 def main():
     app = ElectricityForecastApp()
