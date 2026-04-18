@@ -1033,26 +1033,6 @@ class ElectricityForecastApp:
         with col4:
             st.metric("Peak Demand", f"{max_demand:,} MW")
 
-        # --- MODEL ACCURACY SECTION ---
-        metrics = st.session_state.model_metrics
-        if metrics:
-            st.markdown("---")
-            acc_col1, acc_col2, acc_col3, acc_col4, acc_col5 = st.columns(5)
-            with acc_col1:
-                st.markdown(f"### 🎯 Model Accuracy: {metrics.get('accuracy', 0):.1f}%")
-            with acc_col2:
-                st.write(f"**MAPE:** {metrics.get('mape', 0):.2f}%")
-            with acc_col3:
-                st.write(f"**RMSE:** {metrics.get('rmse', 0):.2f} MW")
-            with acc_col4:
-                st.write(f"**MAE:** {metrics.get('mae', 0):.2f} MW")
-            with acc_col5:
-                st.write(f"**R²:** {metrics.get('r2', 0):.4f}")
-            status = "✅ PASS" if metrics.get("accuracy", 0) >= 85 else "❌ FAIL"
-            st.write(f"**Status:** {status}")
-
-        st.markdown("---")
-
         col1, col2 = st.columns([2, 1])
 
         with col1:
