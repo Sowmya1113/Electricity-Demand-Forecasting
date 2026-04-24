@@ -1324,9 +1324,7 @@ class ElectricityForecastApp:
             fig2 = px.scatter(
                 historical,
                 x="temperature",
-                y="demand_mw",
-                title="Temperature vs Demand",
-                trendline="ols",
+                y="demand_mw"
             )
             fig2.update_traces(marker_color="#f59e0b")
             fig2.update_layout(template="plotly_white")
