@@ -114,40 +114,35 @@ def preprocess(df: pd.DataFrame, target_col: str = "demand_mw"):
 # ============================================
 def run_evaluation(model, test_loader, preprocessor, evaluator, label="Ensemble"):
     """
-    Evaluate model on test set and return metrics in original MW scale.
-    Inverse‑transforms predictions using preprocessor.target_scaler.
+    Run model over test_loader and return metrics dict.
+    Inverse-transforms predictions back to MW scale before computing metrics.
     """
     device = next(model.parameters()).device
+    all_preds, all_targets = [], []
+
     model.eval()
-
-    all_preds = []
-    all_targets = []
-
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             X_batch = X_batch.to(device)
             output = model(X_batch)
             all_preds.append(output.cpu().numpy())
-            all_targets.append(y_batch.cpu().numpy())
+            all_targets.append(y_batch.numpy())
 
-    # Concatenate batches
-    y_pred_scaled = np.concatenate(all_preds)   # shape: (n_samples, output_length)
-    y_true_scaled = np.concatenate(all_targets)
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
 
-    # Inverse transform to original MW scale
-    y_true_mw = preprocessor.inverse_transform_target(y_true_scaled.flatten())
-    y_pred_mw = preprocessor.inverse_transform_target(y_pred_scaled.flatten())
+    # Inverse-transform to original MW scale for meaningful metrics
+    y_true_mw = preprocessor.inverse_transform_target(all_targets.flatten())
+    y_pred_mw = preprocessor.inverse_transform_target(all_preds.flatten())
 
-    # Compute metrics on original MW values
     metrics = evaluator.calculate_metrics(y_true_mw, y_pred_mw)
 
-    # Log results
     logger.info(
-        f"[{label}] MAPE={metrics['mape']:.2f}%  RMSE={metrics['rmse']:.2f} MW  "
+        f"[{label}] MAPE={metrics['mape']:.2f}%  RMSE={metrics['rmse']:.2f}  "
         f"R²={metrics['r2']:.4f}  Accuracy={metrics['accuracy']:.2f}%"
     )
-
     return metrics
+
 
 # ============================================
 # SECTION 4: PRINT REPORT
@@ -175,11 +170,14 @@ def print_report(metrics: dict, label: str = "ACCURACY REPORT"):
 # SECTION 5: SAVE METRICS JSON
 # ============================================
 def save_metrics_json(metrics: dict, path: str = "models/metrics.json"):
-    """Save metrics in original MW scale to JSON for dashboard display."""
+    """
+    Save metrics to JSON so app.py can load them without PyTorch.
+    FIX: app.py checks models/metrics.json first — this ensures it is always written.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(metrics, f, indent=2)
-    logger.info(f"✅ Metrics saved to {path}")
+    logger.info(f"Metrics saved to {path}")
 
 
 # ============================================
